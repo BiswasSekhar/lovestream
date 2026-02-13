@@ -131,6 +131,17 @@ export default function registerSocketHandlers(io, roomManager) {
             }
         });
 
+        // ─── Viewer playback readiness ───────────────────────
+        socket.on('viewer-buffer-ready', ({ progress }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                socket.to(room.code).emit('viewer-buffer-ready', {
+                    progress: typeof progress === 'number' ? progress : 0,
+                    from: socket.id,
+                });
+            }
+        });
+
         // ─── WebTorrent magnet sharing ──────────────────────────
         socket.on('torrent-magnet', ({ magnetURI }) => {
             const room = roomManager.getRoomBySocket(socket.id);

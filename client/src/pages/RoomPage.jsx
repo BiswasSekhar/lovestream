@@ -34,6 +34,7 @@ function RoomContent() {
     // Subtitles
     const [subtitleCues, setSubtitleCues] = useState([]);
     const [currentTime, setCurrentTime] = useState(0);
+    const [viewerBufferedReady, setViewerBufferedReady] = useState(false);
 
     // WebRTC (video call only — no movie stream)
     const {
@@ -115,7 +116,9 @@ function RoomContent() {
 
     // Start webcam when entering room
     useEffect(() => {
-        startMedia({ video: true, audio: true }).then(() => setMediaReady(true));
+        startMedia({ video: true, audio: true })
+            .then(() => setMediaReady(true))
+            .catch(err => console.error('[room] media failed:', err));
         return () => stopMedia();
     }, []);
 
@@ -169,6 +172,20 @@ function RoomContent() {
         return () => sock.off('movie-loaded', handleMovieLoaded);
     }, [socket, dispatch]);
 
+    useEffect(() => {
+        const sock = socket.current;
+        if (!sock) return;
+
+        const handleViewerBufferReady = ({ progress }) => {
+            if (!isHost) return;
+            setViewerBufferedReady(true);
+            console.log('[room] viewer is buffered and ready:', progress + '%');
+        };
+
+        sock.on('viewer-buffer-ready', handleViewerBufferReady);
+        return () => sock.off('viewer-buffer-ready', handleViewerBufferReady);
+    }, [socket, isHost]);
+
     // Track current time for subtitles
     const handleTimeUpdate = useCallback(
         (time) => {
@@ -184,10 +201,15 @@ function RoomContent() {
             // Track current file for reconnection sync
             currentFileRef.current = file;
 
+            // New movie selected: require fresh viewer buffer confirmation
+            if (isHost) {
+                setViewerBufferedReady(false);
+            }
+
             // Seed the file via WebTorrent (P2P)
             seedFile(file);
         },
-        [seedFile]
+        [seedFile, isHost]
     );
 
     const currentFileRef = useRef(null);
@@ -290,6 +312,7 @@ function RoomContent() {
                 <div className="room__player-area">
                     <VideoPlayer
                         isHost={isHost}
+                        peerBufferedReady={!isHost || viewerBufferedReady}
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
                         movieBlobUrl={movieBlobUrl}
                         downloadProgress={downloadProgress}

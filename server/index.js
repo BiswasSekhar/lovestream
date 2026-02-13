@@ -3,9 +3,14 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import TrackerServer from 'bittorrent-tracker/lib/server.js';
+import { WebSocketServer } from 'ws';
+import { Server as TrackerServer } from 'bittorrent-tracker';
 import RoomManager from './roomManager.js';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import registerSocketHandlers from './socketHandlers.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const app = express();
 const httpServer = createServer(app);
@@ -57,6 +62,14 @@ app.get('/ice-servers', (_req, res) => {
     res.json(servers);
 });
 
+// Serve static files from the React client build
+app.use(express.static(join(__dirname, '../client/dist')));
+
+// Handle React routing, return all requests to React app
+app.get('*', (req, res) => {
+    res.sendFile(join(__dirname, '../client/dist', 'index.html'));
+});
+
 // WebTorrent tracker (peer discovery for P2P movie sharing)
 const tracker = new TrackerServer({
     http: false,  // no HTTP tracker
@@ -76,7 +89,28 @@ httpServer.listen(PORT, () => {
     console.log(`🚀 Lovestream server running on port ${PORT}`);
     console.log(`   Accepting connections from: ${CLIENT_URL}`);
 
-    // Attach tracker to the same HTTP server
-    tracker.http = httpServer;
+    // ─── Manual Upgrade Handling ────────────────────────────
+    // Socket.IO and WebTorrent tracker both want to handle WebSockets on the same port.
+    // We must manually route the upgrade requests to prevent conflicts.
+
+    const wss = new WebSocketServer({ noServer: true });
+
+    wss.on('connection', (ws) => {
+        // Pass the WebSocket connection to the tracker
+        tracker.onWebSocketConnection(ws);
+    });
+
+    httpServer.on('upgrade', (req, socket, head) => {
+        if (req.url.startsWith('/socket.io/')) {
+            // Let Socket.IO handle it (it attaches its own listener)
+            return;
+        }
+
+        // Otherwise, handle as WebTorrent tracker request
+        wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit('connection', ws, req);
+        });
+    });
+
     console.log(`   WebTorrent tracker ready on ws://localhost:${PORT}`);
 });

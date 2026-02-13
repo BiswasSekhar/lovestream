@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import WebTorrent from 'webtorrent';
+import renderMedia from 'render-media';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
@@ -27,6 +28,7 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
     const clientRef = useRef(null);
     const torrentRef = useRef(null);
     const progressIntervalRef = useRef(null);
+    const hasSentBufferReadyRef = useRef(false);
 
     // Get tracker URL from server URL
     const trackerUrl = SERVER_URL.replace(/^http/, 'ws') + '/';
@@ -62,6 +64,41 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
             setTransferSpeed(torrent.downloadSpeed || torrent.uploadSpeed || 0);
             setNumPeers(torrent.numPeers);
         }, 500);
+    }, []);
+
+    const createBlobUrlFallback = useCallback(async (videoFile) => {
+        if (!videoFile) return;
+
+        try {
+            if (typeof videoFile.getBlobURL === 'function') {
+                videoFile.getBlobURL((err, url) => {
+                    if (err) {
+                        console.error('[webtorrent] getBlobURL error:', err);
+                        return;
+                    }
+                    setMovieBlobUrl(url);
+                });
+                return;
+            }
+
+            if (typeof videoFile.arrayBuffer === 'function') {
+                const buffer = await videoFile.arrayBuffer();
+                const lower = (videoFile.name || '').toLowerCase();
+                const mime = lower.endsWith('.webm')
+                    ? 'video/webm'
+                    : lower.endsWith('.mov')
+                        ? 'video/quicktime'
+                        : 'video/mp4';
+                const blob = new Blob([buffer], { type: mime });
+                const url = URL.createObjectURL(blob);
+                setMovieBlobUrl(url);
+                return;
+            }
+
+            console.warn('[webtorrent] No compatible blob fallback API on torrent file');
+        } catch (err) {
+            console.error('[webtorrent] blob fallback failed:', err);
+        }
     }, []);
 
     const stopProgressUpdates = useCallback(() => {
@@ -130,6 +167,7 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
 
             setIsReceiving(true);
             setDownloadProgress(0);
+            hasSentBufferReadyRef.current = false;
 
             client.add(magnetURI, {
                 announce: [trackerUrl],
@@ -149,26 +187,24 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
                 if (videoFile) {
                     setMovieFileName(videoFile.name);
 
-                    // Stream to video element via MSE (WebTorrent handles this)
+                    // Stream to video element via render-media (MSE)
                     if (videoRef?.current) {
-                        videoFile.renderTo(videoRef.current, {
-                            autoplay: false,
-                            controls: false,
-                        }, (err, elem) => {
-                            if (err) {
-                                console.error('[webtorrent] renderTo error:', err.message);
-                                // Fallback: create blob URL
-                                videoFile.getBlobURL((err, url) => {
-                                    if (err) {
-                                        console.error('[webtorrent] getBlobURL error:', err);
-                                        return;
-                                    }
-                                    setMovieBlobUrl(url);
-                                });
-                            } else {
-                                console.log('[webtorrent] streaming to video element');
-                            }
-                        });
+                        try {
+                            renderMedia.render(videoFile, videoRef.current, {
+                                autoplay: false,
+                                controls: false,
+                            }, (err, elem) => {
+                                if (err) {
+                                    console.error('[webtorrent] renderMedia error:', err.message);
+                                    createBlobUrlFallback(videoFile);
+                                } else {
+                                    console.log('[webtorrent] streaming to video element via render-media');
+                                }
+                            });
+                        } catch (renderErr) {
+                            console.error('[webtorrent] render call failed:', renderErr);
+                            createBlobUrlFallback(videoFile);
+                        }
                     }
                 }
 
@@ -180,16 +216,22 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
 
                     // Also create blob URL as backup
                     if (videoFile) {
-                        videoFile.getBlobURL((err, url) => {
-                            if (!err) {
-                                setMovieBlobUrl(url);
-                            }
-                        });
+                        createBlobUrlFallback(videoFile);
                     }
                 });
 
                 torrent.on('wire', () => {
                     setNumPeers(torrent.numPeers);
+                });
+
+                torrent.on('download', () => {
+                    if (hasSentBufferReadyRef.current) return;
+                    const progressPercent = Math.round((torrent.progress || 0) * 100);
+                    if (progressPercent >= 3) {
+                        socket?.current?.emit('viewer-buffer-ready', { progress: progressPercent });
+                        hasSentBufferReadyRef.current = true;
+                        console.log('[webtorrent] viewer buffered enough for playback:', progressPercent + '%');
+                    }
                 });
             });
         };
@@ -198,7 +240,7 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
         return () => {
             sock.off('torrent-magnet', handleMagnet);
         };
-    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates]);
+    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates, createBlobUrlFallback]);
 
     return {
         seedFile,

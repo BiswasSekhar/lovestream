@@ -6,9 +6,11 @@ import Controls from './Controls.jsx';
 
 export default function VideoPlayer({
     isHost,
+    peerBufferedReady = true,
     videoRef,
     movieBlobUrl,       // Viewer: blob URL from data channel transfer
     downloadProgress,   // Viewer: 0-100 download progress
+    transferSpeed,      // Viewer: transfer speed in bytes/sec
     numPeers,           // Viewer: number of P2P peers
     isReceiving,        // Viewer: currently receiving file transfer
     onFileReady,        // Host: callback with (file, blobUrl) when movie is ready
@@ -24,6 +26,7 @@ export default function VideoPlayer({
     const [loadProgress, setLoadProgress] = useState(0);
     const [error, setError] = useState('');
     const [isDragging, setIsDragging] = useState(false);
+    const [playbackNotice, setPlaybackNotice] = useState('');
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
     const selectedFileRef = useRef(null);
@@ -188,8 +191,17 @@ export default function VideoPlayer({
     // Playback sync handlers
     const handlePlay = useCallback(() => {
         const video = videoRef.current;
-        if (video) playbackSync?.emitPlay(video.currentTime);
-    }, [videoRef, playbackSync]);
+        if (!video) return;
+
+        if (isHost && !peerBufferedReady) {
+            setPlaybackNotice('Waiting for your partner to buffer the movie...');
+            video.pause();
+            return;
+        }
+
+        setPlaybackNotice('');
+        playbackSync?.emitPlay(video.currentTime);
+    }, [videoRef, playbackSync, isHost, peerBufferedReady]);
 
     const handlePause = useCallback(() => {
         const video = videoRef.current;
@@ -200,6 +212,12 @@ export default function VideoPlayer({
         const video = videoRef.current;
         if (video) playbackSync?.emitSeek(video.currentTime);
     }, [videoRef, playbackSync]);
+
+    useEffect(() => {
+        if (peerBufferedReady) {
+            setPlaybackNotice('');
+        }
+    }, [peerBufferedReady]);
 
     // Host file picker area (when no movie loaded)
     if (isHost && !localMovieUrl && !isLoading) {
@@ -255,7 +273,8 @@ export default function VideoPlayer({
     }
 
     // Viewer: downloading file from host (only show waiting screen if NO streaming source is ready)
-    if (!isHost && !movieBlobUrl) {
+    // If isReceiving is true, we render the video player so renderTo can stream to it.
+    if (!isHost && !movieBlobUrl && !isReceiving) {
         return (
             <div className="player__waiting">
                 <div className="player__waiting-content">
@@ -289,21 +308,25 @@ export default function VideoPlayer({
         );
     }
 
+    const videoSrc = isHost ? localMovieUrl : movieBlobUrl;
+    const hasDirectVideoSrc = Boolean(videoSrc);
+    const videoSourceProps = hasDirectVideoSrc ? { src: videoSrc } : {};
+
     return (
         <div className="player" onDragOver={isHost ? handleDragOver : undefined} onDrop={isHost ? handleDrop : undefined}>
             <video
                 ref={videoRef}
                 className="player__video"
-                src={isHost ? localMovieUrl : movieBlobUrl}
+                {...videoSourceProps}
                 onLoadedMetadata={handleLoadedMetadata}
                 onPlay={handlePlay}
                 onPause={handlePause}
                 onSeeked={handleSeek}
                 onError={(e) => console.error('[player] video error:', videoRef.current?.error, e)}
-                onLoadStart={() => console.log('[player] load start, src:', isHost ? localMovieUrl : movieBlobUrl)}
+                onLoadStart={() => console.log('[player] load start, currentSrc:', videoRef.current?.currentSrc || null)}
                 onCanPlay={() => console.log('[player] can play')}
                 playsInline
-                autoPlay
+                autoPlay={!isHost && hasDirectVideoSrc}
                 muted={!isHost} // Muted autoplay to ensure frame rendering
             />
 
@@ -325,6 +348,7 @@ export default function VideoPlayer({
             )}
 
             {error && <div className="player__error">{error}</div>}
+            {playbackNotice && <div className="player__error">{playbackNotice}</div>}
         </div>
     );
 }

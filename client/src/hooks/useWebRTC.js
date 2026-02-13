@@ -95,6 +95,11 @@ export default function useWebRTC({
             });
 
             peer.on('error', (err) => {
+                // Ignore "User-Initiated Abort" (happens on clean close)
+                if (err.message && err.message.includes('User-Initiated Abort')) {
+                    console.log('[webrtc] peer connection closed (clean abort)');
+                    return;
+                }
                 console.error('[webrtc] error:', err.message);
                 setConnectionState('disconnected');
                 onDisconnectRef.current?.();

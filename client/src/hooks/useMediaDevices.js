@@ -24,9 +24,24 @@ export default function useMediaDevices() {
                         echoCancellation: true,
                         noiseSuppression: true,
                         autoGainControl: true,
+                        channelCount: { ideal: 1 },
+                        sampleRate: { ideal: 48000 },
+                        sampleSize: { ideal: 16 },
+                        latency: { ideal: 0.02 },
                     }
                     : false,
             });
+
+            // Apply conferencing-style processing constraints where supported.
+            stream.getAudioTracks().forEach((track) => {
+                track.applyConstraints({
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 1,
+                }).catch(() => { });
+            });
+
             streamRef.current = stream;
             setLocalStream(stream);
             setCameraOn(video);
@@ -41,7 +56,7 @@ export default function useMediaDevices() {
             } else {
                 setPermissionError(`Could not access camera/mic: ${err.message}`);
             }
-            return null;
+            throw err; // Re-throw so RoomPage knows media failed
         }
     }, []);
 

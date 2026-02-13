@@ -16,7 +16,7 @@ export default defineConfig({
   ],
   resolve: {
     alias: {
-      webtorrent: 'webtorrent/dist/webtorrent.min.js',
+      // webtorrent: 'webtorrent/dist/webtorrent.min.js', // removed to use source/main
     },
   },
   server: {
