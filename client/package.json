@@ -3,6 +3,8 @@
     "private": true,
     "version": "1.0.0",
     "type": "module",
+    "description": "P2P movie streaming and video chat",
+    "author": "Biswas",
     "main": "electron/main.cjs",
     "scripts": {
         "dev": "vite",
@@ -23,7 +25,14 @@
             "electron/**/*"
         ],
         "win": {
-            "target": "nsis"
+            "target": "nsis",
+            "forceCodeSigning": false
+        },
+        "nsis": {
+            "oneClick": false,
+            "allowToChangeInstallationDirectory": true,
+            "createDesktopShortcut": true,
+            "runAfterFinish": true
         },
         "mac": {
             "target": [
@@ -51,6 +60,7 @@
         "@types/react": "^19.0.0",
         "@types/react-dom": "^19.0.0",
         "@vitejs/plugin-react": "^4.3.4",
+        "7zip-bin": "^5.2.0",
         "concurrently": "^9.1.2",
         "electron": "34.0.2",
         "electron-builder": "^26.7.0",
