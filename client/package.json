@@ -52,6 +52,7 @@
         "@ffmpeg/ffmpeg": "^0.12.15",
         "@ffmpeg/util": "^0.12.2",
         "buffer": "^6.0.3",
+        "mp4box": "^2.3.0",
         "process": "^0.11.10",
         "react": "^19.0.0",
         "react-dom": "^19.0.0",

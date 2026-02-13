@@ -1,5 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { needsTransmux, transmuxToFMP4 } from '../../utils/mkvHandler.js';
+import { fragmentMP4, isNativeMP4, probeMP4 } from '../../utils/mp4Fragmenter.js';
 import { parseSubtitles } from '../../utils/subtitleParser.js';
 import Controls from './Controls.jsx';
 
@@ -8,6 +9,7 @@ export default function VideoPlayer({
     videoRef,
     movieBlobUrl,       // Viewer: blob URL from data channel transfer
     downloadProgress,   // Viewer: 0-100 download progress
+    transferSpeed,      // Viewer: transfer speed in bytes/second
     isReceiving,        // Viewer: currently receiving file transfer
     onFileReady,        // Host: callback with (file, blobUrl) when movie is ready
     onTimeUpdate,
@@ -23,39 +25,63 @@ export default function VideoPlayer({
     const sourceBufferRef = useRef(null);
     const chunkQueueRef = useRef([]);
 
-    // MSE Logic
+    // MSE Logic with error recovery, buffer trimming, and queue limiting
     useEffect(() => {
         if (isHost || !streamHandlersRef?.current) return;
 
+        const MAX_QUEUE_SIZE = 50; // Max buffered chunks to prevent memory blowup
+        const BUFFER_TRIM_THRESHOLD = 60; // Seconds of buffer behind current time to keep
+
         streamHandlersRef.current.onMeta = (meta) => {
             // Use the MIME type sent by Host (includes codecs)
-            // Note: meta.type is 'file-meta', we need meta.mimeType
-            const mimeType = meta.mimeType || 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
+            let mimeType = meta.mimeType || 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
 
-            if (MediaSource.isTypeSupported(mimeType)) {
-                console.log('[player] initializing MSE for streaming with type:', mimeType);
-                const ms = new MediaSource();
-                mediaSourceRef.current = ms;
-
-                ms.addEventListener('sourceopen', () => {
-                    try {
-                        const sb = ms.addSourceBuffer(mimeType);
-                        sourceBufferRef.current = sb;
-                        sb.addEventListener('updateend', processQueue);
-                        console.log('[player] source buffer ready');
-                    } catch (e) {
-                        console.error('[player] MSE addSourceBuffer error:', e);
-                    }
-                });
-
-                const url = URL.createObjectURL(ms);
-                setMediaSourceUrl(url);
-            } else {
-                console.warn('[player] MSE not supported for type:', mimeType);
+            // Check if the browser supports the declared MIME type
+            if (!MediaSource.isTypeSupported(mimeType)) {
+                console.warn('[player] MSE not supported for:', mimeType, '— trying fallback');
+                // Try generic fallback
+                const fallback = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
+                if (MediaSource.isTypeSupported(fallback)) {
+                    mimeType = fallback;
+                } else {
+                    console.error('[player] No supported MIME type found');
+                    return;
+                }
             }
+
+            console.log('[player] initializing MSE for streaming with type:', mimeType);
+            const ms = new MediaSource();
+            mediaSourceRef.current = ms;
+
+            ms.addEventListener('sourceopen', () => {
+                try {
+                    const sb = ms.addSourceBuffer(mimeType);
+                    sourceBufferRef.current = sb;
+                    sb.addEventListener('updateend', () => {
+                        trimBuffer();
+                        processQueue();
+                    });
+                    sb.addEventListener('error', (e) => {
+                        console.error('[player] SourceBuffer error:', e);
+                        // Skip the problematic chunk and continue
+                        processQueue();
+                    });
+                    console.log('[player] source buffer ready');
+                } catch (e) {
+                    console.error('[player] MSE addSourceBuffer error:', e);
+                }
+            });
+
+            const url = URL.createObjectURL(ms);
+            setMediaSourceUrl(url);
         };
 
         streamHandlersRef.current.onChunk = (chunk) => {
+            // Queue limiting — drop oldest if queue is too large
+            if (chunkQueueRef.current.length >= MAX_QUEUE_SIZE) {
+                console.warn('[player] chunk queue full, dropping oldest chunk');
+                chunkQueueRef.current.shift();
+            }
             chunkQueueRef.current.push(chunk);
             processQueue();
         };
@@ -64,11 +90,39 @@ export default function VideoPlayer({
             const sb = sourceBufferRef.current;
             if (!sb || sb.updating || chunkQueueRef.current.length === 0) return;
 
+            const ms = mediaSourceRef.current;
+            if (!ms || ms.readyState !== 'open') return;
+
             try {
                 const chunk = chunkQueueRef.current.shift();
                 sb.appendBuffer(chunk);
             } catch (e) {
-                console.error('[player] appendBuffer error:', e);
+                console.error('[player] appendBuffer error:', e.message);
+                // If QuotaExceededError, trim buffer aggressively and retry
+                if (e.name === 'QuotaExceededError') {
+                    console.log('[player] buffer full, trimming aggressively...');
+                    trimBuffer(10); // Keep only 10s behind
+                    // Re-queue the chunk for retry
+                    setTimeout(processQueue, 100);
+                }
+            }
+        };
+
+        const trimBuffer = (maxBehind = BUFFER_TRIM_THRESHOLD) => {
+            const sb = sourceBufferRef.current;
+            const video = videoRef?.current;
+            if (!sb || sb.updating || !video) return;
+
+            try {
+                const currentTime = video.currentTime;
+                if (sb.buffered.length > 0) {
+                    const bufferStart = sb.buffered.start(0);
+                    if (currentTime - bufferStart > maxBehind) {
+                        sb.remove(bufferStart, currentTime - maxBehind);
+                    }
+                }
+            } catch (e) {
+                // Ignore trim errors
             }
         };
 
@@ -101,27 +155,62 @@ export default function VideoPlayer({
                 let url;
                 let processedFile = file;
 
-                if (needsTransmux(file)) {
+                if (isNativeMP4(file)) {
+                    // MP4 files: Use mp4box.js for INSTANT fragmentation
+                    console.log('[player] MP4 detected — using mp4box.js (fast path)');
                     setLoadProgress(5);
-                    // transmuxToFMP4 returns { url, mime, isHevc }
-                    const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
-                    url = result.url;
-                    const mime = result.mime;
-                    const isHevc = result.isHevc;
 
-                    if (isHevc) {
-                        console.log('[player] HEVC detected. MSE support depends on browser/hardware.');
+                    // First probe to check codecs
+                    const probeResult = await probeMP4(file);
+                    console.log('[player] Probe result:', probeResult);
+
+                    if (probeResult.isHevc) {
+                        const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                        if (hevcSupported) {
+                            console.log('[player] HEVC supported by browser — passing through');
+                        } else {
+                            console.warn('[player] HEVC not supported by this browser. Playback may fail.');
+                            setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge.');
+                        }
                     }
 
-                    // Fetch blob for transfer
+                    if (!probeResult.hasAac) {
+                        // Non-AAC audio in MP4 — need ffmpeg to transcode audio
+                        console.log('[player] Non-AAC audio detected, using ffmpeg for audio transcoding');
+                        setLoadProgress(10);
+                        const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
+                        url = result.url;
+                        const response = await fetch(url);
+                        const blob = await response.blob();
+                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                        processedFile = new File([blob], newName, { type: result.mime });
+                    } else {
+                        // AAC audio — use mp4box.js (instant)
+                        const result = await fragmentMP4(file, (p) => setLoadProgress(p));
+                        url = result.url;
+                        const response = await fetch(url);
+                        const blob = await response.blob();
+                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                        processedFile = new File([blob], newName, { type: result.mime });
+                    }
+                } else if (needsTransmux(file)) {
+                    // MKV and other formats: Use ffmpeg.wasm (remux only)
+                    console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
+                    setLoadProgress(5);
+                    const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
+                    url = result.url;
+
+                    if (result.isHevc) {
+                        const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                        if (!hevcSupported) {
+                            setError('This video uses HEVC/H.265 which your browser may not support.');
+                        }
+                    }
+
                     const response = await fetch(url);
                     const blob = await response.blob();
-
-                    // Force .mp4 extension and use detected mime
-                    const newName = file.name.replace(/\.[^/.]+$/, "") + ".mp4";
-                    processedFile = new File([blob], newName, {
-                        type: mime,
-                    });
+                    const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                    processedFile = new File([blob], newName, { type: result.mime });
                 } else {
                     url = URL.createObjectURL(file);
                 }
@@ -293,7 +382,10 @@ export default function VideoPlayer({
                             <div className="player__progress-bar">
                                 <div className="player__progress-fill" style={{ width: `${downloadProgress}%` }} />
                             </div>
-                            <span className="player__progress-text">{downloadProgress}%</span>
+                            <span className="player__progress-text">
+                                {downloadProgress}%
+                                {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
+                            </span>
                         </>
                     ) : (
                         <>

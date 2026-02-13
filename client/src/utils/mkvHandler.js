@@ -139,16 +139,17 @@ export async function transmuxToFMP4(file, onProgress) {
 }
 
 /**
- * Check if a file needs transmuxing (MKV or MP4).
- * Basically any container we want to stream via MSE.
+ * Check if a file needs transmuxing via ffmpeg (MKV, WebM, etc).
+ * MP4 files are handled by mp4box.js instead (much faster).
  */
 export function needsTransmux(file) {
     const name = file.name.toLowerCase();
     const type = file.type;
     return (
         name.endsWith('.mkv') ||
-        name.endsWith('.mp4') ||
+        name.endsWith('.webm') ||
+        name.endsWith('.avi') ||
         type === 'video/x-matroska' ||
-        type === 'video/mp4'
+        type === 'video/webm'
     );
 }

@@ -91,6 +91,7 @@ function RoomContent() {
         sendFile,
         movieBlobUrl,
         downloadProgress,
+        transferSpeed,
         isSending,
         isReceiving,
     } = useFileStream({
@@ -313,6 +314,7 @@ function RoomContent() {
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
                         movieBlobUrl={movieBlobUrl}
                         downloadProgress={downloadProgress}
+                        transferSpeed={transferSpeed}
                         isReceiving={isReceiving}
                         onFileReady={handleFileReady}
                         onTimeUpdate={handleTimeUpdate}

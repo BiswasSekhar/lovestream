@@ -22,13 +22,15 @@ Start-Sleep -Seconds 2
 Write-Host "[2/5] Creating tunnel for server (port 3001)..." -ForegroundColor Cyan
 
 $serverTunnelLog = "$env:TEMP\lovestream_server_tunnel.log"
-$serverTunnel = Start-Process -FilePath "npx" -ArgumentList "-y cloudflared tunnel --url http://localhost:3001" `
-    -RedirectStandardError $serverTunnelLog -PassThru -NoNewWindow -WindowStyle Hidden
+Remove-Item $serverTunnelLog -ErrorAction SilentlyContinue
+$serverTunnel = Start-Process -FilePath "cmd.exe" `
+    -ArgumentList "/c npx -y cloudflared tunnel --url http://localhost:3001 2>$serverTunnelLog" `
+    -PassThru -WindowStyle Hidden
 
 # Wait for server tunnel URL
 $serverTunnelUrl = $null
 $attempts = 0
-while (-not $serverTunnelUrl -and $attempts -lt 30) {
+while (-not $serverTunnelUrl -and $attempts -lt 40) {
     Start-Sleep -Seconds 1
     $attempts++
     if (Test-Path $serverTunnelLog) {
@@ -40,7 +42,7 @@ while (-not $serverTunnelUrl -and $attempts -lt 30) {
 }
 
 if (-not $serverTunnelUrl) {
-    Write-Host "[ERROR] Could not get server tunnel URL." -ForegroundColor Red
+    Write-Host "[ERROR] Could not get server tunnel URL after 40s." -ForegroundColor Red
     Stop-Job $serverJob -ErrorAction SilentlyContinue
     exit 1
 }
@@ -63,13 +65,15 @@ Start-Sleep -Seconds 5
 Write-Host "[5/5] Creating tunnel for client (port 5173)..." -ForegroundColor Cyan
 
 $clientTunnelLog = "$env:TEMP\lovestream_client_tunnel.log"
-$clientTunnel = Start-Process -FilePath "npx" -ArgumentList "-y cloudflared tunnel --url http://localhost:5173" `
-    -RedirectStandardError $clientTunnelLog -PassThru -NoNewWindow -WindowStyle Hidden
+Remove-Item $clientTunnelLog -ErrorAction SilentlyContinue
+$clientTunnel = Start-Process -FilePath "cmd.exe" `
+    -ArgumentList "/c npx -y cloudflared tunnel --url http://localhost:5173 2>$clientTunnelLog" `
+    -PassThru -WindowStyle Hidden
 
 # Wait for client tunnel URL
 $clientTunnelUrl = $null
 $attempts = 0
-while (-not $clientTunnelUrl -and $attempts -lt 30) {
+while (-not $clientTunnelUrl -and $attempts -lt 40) {
     Start-Sleep -Seconds 1
     $attempts++
     if (Test-Path $clientTunnelLog) {
@@ -81,7 +85,7 @@ while (-not $clientTunnelUrl -and $attempts -lt 30) {
 }
 
 if (-not $clientTunnelUrl) {
-    Write-Host "[WARNING] Could not get client tunnel URL. Remote access may not work." -ForegroundColor Yellow
+    Write-Host "[WARNING] Could not get client tunnel URL." -ForegroundColor Yellow
     $clientTunnelUrl = "N/A"
 }
 
@@ -103,7 +107,6 @@ Write-Host ""
 Write-Host "  Press ENTER to stop everything." -ForegroundColor Yellow
 Write-Host ""
 
-# Wait for user to press Enter
 Read-Host "Press ENTER to shut down"
 
 # Cleanup
@@ -120,8 +123,5 @@ if ($clientTunnel -and -not $clientTunnel.HasExited) {
     Stop-Process -Id $clientTunnel.Id -Force -ErrorAction SilentlyContinue
 }
 Remove-Item $serverTunnelLog, $clientTunnelLog -ErrorAction SilentlyContinue
-
-# Kill any remaining cloudflared processes
 Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-
 Write-Host "Done!" -ForegroundColor Green
