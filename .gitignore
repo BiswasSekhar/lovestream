@@ -1,5 +1,18 @@
 node_modules/
 dist/
 .env
+.env.local
+.env.production
 *.log
 .DS_Store
+
+# Electron build output
+client/Lovestream-win32-x64/
+client/Lovestream-darwin-x64/
+client/Lovestream-linux-x64/
+client/dist_electron/
+client/electron-cache/
+
+# Tunnel files
+cloudflared.exe
+*.log
