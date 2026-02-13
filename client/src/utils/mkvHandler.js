@@ -62,8 +62,10 @@ export async function transmuxToFMP4(file, onProgress) {
 
     await ffmpeg.writeFile(inputName, await fetchFile(file));
 
-    let detectedCodec = 'avc1.42E01E, mp4a.40.2'; // Default to H.264 Main
+    let detectedVideoCodec = 'avc1.42E01E'; // Default to H.264 Baseline
+    let detectedAudioCodec = 'mp4a.40.2'; // Default to AAC-LC
     let isHevc = false;
+    let audioNeedsTranscode = false;
 
     // Capture logs to detect codec
     ffmpeg.on('log', ({ message }) => {
@@ -73,24 +75,49 @@ export async function transmuxToFMP4(file, onProgress) {
                 console.log('[ffmpeg] Detected H.264');
                 // Detect Profile
                 if (message.includes('High')) {
-                    detectedCodec = 'avc1.640028,mp4a.40.2'; // High Profile Level 4.0
+                    detectedVideoCodec = 'avc1.640028'; // High Profile Level 4.0
                 } else if (message.includes('Main')) {
-                    detectedCodec = 'avc1.4d401f,mp4a.40.2'; // Main Profile Level 3.1
+                    detectedVideoCodec = 'avc1.4d401f'; // Main Profile Level 3.1
                 } else {
-                    detectedCodec = 'avc1.42E01E,mp4a.40.2'; // Constrained Baseline
+                    detectedVideoCodec = 'avc1.42E01E'; // Constrained Baseline
                 }
             } else if (message.includes('hevc') || message.includes('h265')) {
                 console.log('[ffmpeg] Detected HEVC');
                 isHevc = true;
-                detectedCodec = 'hvc1.1.6.L93.B0,mp4a.40.2'; // Generic HEVC
+                detectedVideoCodec = 'hvc1.1.6.L93.B0'; // Generic HEVC
+            }
+        }
+        // Detect audio codec
+        if (message.includes('Audio:')) {
+            console.log('[ffmpeg] Audio info:', message);
+            if (message.includes('aac')) {
+                detectedAudioCodec = 'mp4a.40.2'; // AAC-LC
+                audioNeedsTranscode = false;
+            } else if (message.includes('ac3') || message.includes('eac3') || message.includes('dts') || message.includes('truehd')) {
+                console.log('[ffmpeg] Non-AAC audio detected, will transcode to AAC');
+                detectedAudioCodec = 'mp4a.40.2'; // Will be transcoded to AAC
+                audioNeedsTranscode = true;
+            } else if (message.includes('opus') || message.includes('vorbis') || message.includes('flac')) {
+                console.log('[ffmpeg] Non-AAC audio detected, will transcode to AAC');
+                detectedAudioCodec = 'mp4a.40.2';
+                audioNeedsTranscode = true;
+            } else {
+                // Unknown audio codec — transcode to AAC to be safe
+                console.log('[ffmpeg] Unknown audio codec, will transcode to AAC');
+                detectedAudioCodec = 'mp4a.40.2';
+                audioNeedsTranscode = true;
             }
         }
     });
 
     // Remux to fMP4 (fragmented)
+    // Always transcode audio to AAC for MSE compatibility
+    // Copy video codec (no re-encoding) for speed
     await ffmpeg.exec([
         '-i', inputName,
-        '-c', 'copy',
+        '-c:v', 'copy',
+        '-c:a', 'aac',
+        '-b:a', '192k',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         outputName,
     ]);
@@ -99,6 +126,7 @@ export async function transmuxToFMP4(file, onProgress) {
 
     // Create blob with CORRECT codec string (or generic)
     // If HEVC, browser might still fail if no hardware support.
+    const detectedCodec = `${detectedVideoCodec},${detectedAudioCodec}`;
     const mime = `video/mp4; codecs="${detectedCodec}"`;
     const blob = new Blob([data.buffer], { type: mime });
     const url = URL.createObjectURL(blob);
