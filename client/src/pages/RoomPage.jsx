@@ -116,10 +116,18 @@ function RoomContent() {
         dispatch({ type: 'SET_ROOM', roomCode, role });
     }, [roomCode, role, dispatch]);
 
+    const [mediaReady, setMediaReady] = useState(false);
+
+    // Start webcam when entering room
+    useEffect(() => {
+        startMedia({ video: true, audio: true }).then(() => setMediaReady(true));
+        return () => stopMedia();
+    }, []);
+
     // Signal readiness for WebRTC connection
     useEffect(() => {
         const sock = socket.current;
-        if (!sock || !isConnected) return;
+        if (!sock || !isConnected || !mediaReady) return;
 
         // If viewer, also re-join the room socket room (for reconnection)
         if (!isHost) {
@@ -137,13 +145,7 @@ function RoomContent() {
             console.log('[room] host ready, emitting ready-for-connection');
             sock.emit('ready-for-connection');
         }
-    }, [isConnected, isHost, roomCode, socket]);
-
-    // Start webcam when entering room
-    useEffect(() => {
-        startMedia({ video: true, audio: true });
-        return () => stopMedia();
-    }, []);
+    }, [isConnected, isHost, roomCode, socket, mediaReady]);
 
     // Listen for subtitle data from host
     useEffect(() => {
