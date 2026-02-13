@@ -88,15 +88,12 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
             // Binary chunk
             const chunk = rawData instanceof ArrayBuffer ? new Uint8Array(rawData) : rawData;
 
-            // OPTIMIZATION: If onChunk is handled (MSE), don't buffer in memory
-            // This allows streaming large files (10GB+) without crashing the browser
-            if (!onChunk) {
-                chunksRef.current.push(chunk);
-            }
+            // Always buffer chunks for blob URL (fallback for HEVC or non-MSE playback)
+            chunksRef.current.push(chunk);
 
             receivedSizeRef.current += chunk.byteLength;
 
-            // Streaming callback
+            // Also stream to MSE if callback is set
             onChunk?.(chunk);
 
             const progress = Math.min(
@@ -109,13 +106,12 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
             if (receivedSizeRef.current >= expectedSizeRef.current) {
                 console.log('[filestream] file transfer complete!');
 
-                if (!onChunk) {
-                    const blob = new Blob(chunksRef.current, { type: 'video/mp4' });
-                    const url = URL.createObjectURL(blob);
-                    console.log('[filestream] file transfer complete! blob size:', blob.size, 'url:', url);
-                    setMovieBlobUrl(url);
-                    chunksRef.current = []; // Free memory
-                }
+                // Always create blob URL (used as fallback for HEVC or direct playback)
+                const blob = new Blob(chunksRef.current, { type: 'video/mp4' });
+                const url = URL.createObjectURL(blob);
+                console.log('[filestream] blob size:', blob.size, 'url:', url);
+                setMovieBlobUrl(url);
+                chunksRef.current = []; // Free memory
 
                 setDownloadProgress(100);
                 setIsReceiving(false);

@@ -35,16 +35,25 @@ export default function VideoPlayer({
         streamHandlersRef.current.onMeta = (meta) => {
             // Use the MIME type sent by Host (includes codecs)
             let mimeType = meta.mimeType || 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
+            const isHevcStream = mimeType.includes('hvc1') || mimeType.includes('hev1');
 
             // Check if the browser supports the declared MIME type
             if (!MediaSource.isTypeSupported(mimeType)) {
-                console.warn('[player] MSE not supported for:', mimeType, '— trying fallback');
-                // Try generic fallback
+                if (isHevcStream) {
+                    // HEVC not supported in MSE — fall back to blob URL (no MSE)
+                    // Chrome can still decode HEVC via <video> src without MSE
+                    console.warn('[player] HEVC MSE not supported, will use blob URL fallback');
+                    streamHandlersRef.current._useDirectBlob = true;
+                    return;
+                }
+                // Non-HEVC: try H.264 fallback (different profile)
+                console.warn('[player] MSE not supported for:', mimeType, '— trying H.264 fallback');
                 const fallback = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
                 if (MediaSource.isTypeSupported(fallback)) {
                     mimeType = fallback;
                 } else {
-                    console.error('[player] No supported MIME type found');
+                    console.error('[player] No supported MIME type found, using blob URL');
+                    streamHandlersRef.current._useDirectBlob = true;
                     return;
                 }
             }
@@ -77,6 +86,10 @@ export default function VideoPlayer({
         };
 
         streamHandlersRef.current.onChunk = (chunk) => {
+            // If using direct blob fallback (e.g. HEVC without MSE support),
+            // don't intercept chunks — let useFileStream buffer them into movieBlobUrl
+            if (streamHandlersRef.current._useDirectBlob) return;
+
             // Queue limiting — drop oldest if queue is too large
             if (chunkQueueRef.current.length >= MAX_QUEUE_SIZE) {
                 console.warn('[player] chunk queue full, dropping oldest chunk');
