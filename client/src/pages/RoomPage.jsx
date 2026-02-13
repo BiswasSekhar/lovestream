@@ -3,7 +3,7 @@ import { useParams, useLocation, useNavigate } from 'react-router-dom';
 import { RoomProvider, useRoom } from '../context/RoomContext.jsx';
 import useSocket from '../hooks/useSocket.js';
 import useWebRTC from '../hooks/useWebRTC.js';
-import useFileStream from '../hooks/useFileStream.js';
+import useWebTorrent from '../hooks/useWebTorrent.js';
 import useMediaDevices from '../hooks/useMediaDevices.js';
 import usePlaybackSync from '../hooks/usePlaybackSync.js';
 import VideoPlayer from '../components/Room/VideoPlayer.jsx';
@@ -66,10 +66,10 @@ function RoomContent() {
                     socket.current?.emit('subtitle-data', { subtitles: subtitleCues, filename: state.subtitleFilename });
                 }
 
-                // 3. Resend file (if selected)
+                // 3. Reseed file (if selected)
                 if (currentFileRef.current) {
-                    console.log('[room] peer connected, offering current file');
-                    sendFile(currentFileRef.current);
+                    console.log('[room] peer connected, re-seeding current file');
+                    seedFile(currentFileRef.current);
                 }
             }
         },
@@ -80,25 +80,19 @@ function RoomContent() {
         },
     });
 
-    // Stream handlers (bridge between useFileStream and VideoPlayer)
-    const streamHandlersRef = useRef({
-        onMeta: null,
-        onChunk: null,
-    });
-
-    // File streaming over data channel
+    // File streaming via WebTorrent (P2P)
     const {
-        sendFile,
+        seedFile,
         movieBlobUrl,
         downloadProgress,
         transferSpeed,
+        numPeers,
         isSending,
         isReceiving,
-    } = useFileStream({
-        peer,
+    } = useWebTorrent({
+        socket,
         isHost,
-        onMeta: (meta) => streamHandlersRef.current.onMeta?.(meta),
-        onChunk: (chunk) => streamHandlersRef.current.onChunk?.(chunk),
+        videoRef: isHost ? hostVideoRef : viewerVideoRef,
     });
 
     // Playback sync
@@ -190,28 +184,13 @@ function RoomContent() {
             // Track current file for reconnection sync
             currentFileRef.current = file;
 
-            // Send the file to the viewer via data channel
-            if (connectionState === 'connected') {
-                sendFile(file);
-            } else {
-                console.log('[room] peer not connected yet, will send when connected');
-                // Store file ref to send when connected
-                pendingFileRef.current = file;
-            }
+            // Seed the file via WebTorrent (P2P)
+            seedFile(file);
         },
-        [connectionState, sendFile]
+        [seedFile]
     );
 
-    const pendingFileRef = useRef(null);
     const currentFileRef = useRef(null);
-
-    // Send pending file when connection establishes
-    useEffect(() => {
-        if (connectionState === 'connected' && pendingFileRef.current) {
-            sendFile(pendingFileRef.current);
-            pendingFileRef.current = null;
-        }
-    }, [connectionState, sendFile]);
 
     // Handle subtitles loaded by host
     const handleSubtitlesLoaded = useCallback(
@@ -315,13 +294,13 @@ function RoomContent() {
                         movieBlobUrl={movieBlobUrl}
                         downloadProgress={downloadProgress}
                         transferSpeed={transferSpeed}
+                        numPeers={numPeers}
                         isReceiving={isReceiving}
                         onFileReady={handleFileReady}
                         onTimeUpdate={handleTimeUpdate}
                         onSubtitlesLoaded={handleSubtitlesLoaded}
                         playbackSync={playbackSync}
                         socket={socket}
-                        streamHandlersRef={streamHandlersRef}
                     />
 
                     {/* Subtitle overlay */}

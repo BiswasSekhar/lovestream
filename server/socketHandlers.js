@@ -131,6 +131,15 @@ export default function registerSocketHandlers(io, roomManager) {
             }
         });
 
+        // ─── WebTorrent magnet sharing ──────────────────────────
+        socket.on('torrent-magnet', ({ magnetURI }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                console.log(`[torrent] ${socket.id} sharing magnet in room ${room.code}`);
+                socket.to(room.code).emit('torrent-magnet', { magnetURI });
+            }
+        });
+
         // ─── Disconnect ──────────────────────────────────────────
         socket.on('disconnect', () => {
             console.log(`[disconnect] ${socket.id}`);

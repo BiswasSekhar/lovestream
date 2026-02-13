@@ -9,146 +9,18 @@ export default function VideoPlayer({
     videoRef,
     movieBlobUrl,       // Viewer: blob URL from data channel transfer
     downloadProgress,   // Viewer: 0-100 download progress
-    transferSpeed,      // Viewer: transfer speed in bytes/second
+    numPeers,           // Viewer: number of P2P peers
     isReceiving,        // Viewer: currently receiving file transfer
     onFileReady,        // Host: callback with (file, blobUrl) when movie is ready
     onTimeUpdate,
     onSubtitlesLoaded,
     playbackSync,
     socket,
-    streamHandlersRef,
 }) {
-
     const [localMovieUrl, setLocalMovieUrl] = useState(null);
-    const [mediaSourceUrl, setMediaSourceUrl] = useState(null);
-    const mediaSourceRef = useRef(null);
-    const sourceBufferRef = useRef(null);
-    const chunkQueueRef = useRef([]);
 
-    // MSE Logic with error recovery, buffer trimming, and queue limiting
-    useEffect(() => {
-        if (isHost || !streamHandlersRef?.current) return;
-
-        const MAX_QUEUE_SIZE = 50; // Max buffered chunks to prevent memory blowup
-        const BUFFER_TRIM_THRESHOLD = 60; // Seconds of buffer behind current time to keep
-
-        streamHandlersRef.current.onMeta = (meta) => {
-            // Use the MIME type sent by Host (includes codecs)
-            let mimeType = meta.mimeType || 'video/mp4; codecs="avc1.42E01E,mp4a.40.2"';
-            const isHevcStream = mimeType.includes('hvc1') || mimeType.includes('hev1');
-
-            // Check if the browser supports the declared MIME type
-            if (!MediaSource.isTypeSupported(mimeType)) {
-                if (isHevcStream) {
-                    // HEVC not supported in MSE — fall back to blob URL (no MSE)
-                    // Chrome can still decode HEVC via <video> src without MSE
-                    console.warn('[player] HEVC MSE not supported, will use blob URL fallback');
-                    streamHandlersRef.current._useDirectBlob = true;
-                    return;
-                }
-                // Non-HEVC: try H.264 fallback (different profile)
-                console.warn('[player] MSE not supported for:', mimeType, '— trying H.264 fallback');
-                const fallback = 'video/mp4; codecs="avc1.640028,mp4a.40.2"';
-                if (MediaSource.isTypeSupported(fallback)) {
-                    mimeType = fallback;
-                } else {
-                    console.error('[player] No supported MIME type found, using blob URL');
-                    streamHandlersRef.current._useDirectBlob = true;
-                    return;
-                }
-            }
-
-            console.log('[player] initializing MSE for streaming with type:', mimeType);
-            const ms = new MediaSource();
-            mediaSourceRef.current = ms;
-
-            ms.addEventListener('sourceopen', () => {
-                try {
-                    const sb = ms.addSourceBuffer(mimeType);
-                    sourceBufferRef.current = sb;
-                    sb.addEventListener('updateend', () => {
-                        trimBuffer();
-                        processQueue();
-                    });
-                    sb.addEventListener('error', (e) => {
-                        console.error('[player] SourceBuffer error:', e);
-                        // Skip the problematic chunk and continue
-                        processQueue();
-                    });
-                    console.log('[player] source buffer ready');
-                } catch (e) {
-                    console.error('[player] MSE addSourceBuffer error:', e);
-                }
-            });
-
-            const url = URL.createObjectURL(ms);
-            setMediaSourceUrl(url);
-        };
-
-        streamHandlersRef.current.onChunk = (chunk) => {
-            // If using direct blob fallback (e.g. HEVC without MSE support),
-            // don't intercept chunks — let useFileStream buffer them into movieBlobUrl
-            if (streamHandlersRef.current._useDirectBlob) return;
-
-            // Queue limiting — drop oldest if queue is too large
-            if (chunkQueueRef.current.length >= MAX_QUEUE_SIZE) {
-                console.warn('[player] chunk queue full, dropping oldest chunk');
-                chunkQueueRef.current.shift();
-            }
-            chunkQueueRef.current.push(chunk);
-            processQueue();
-        };
-
-        const processQueue = () => {
-            const sb = sourceBufferRef.current;
-            if (!sb || sb.updating || chunkQueueRef.current.length === 0) return;
-
-            const ms = mediaSourceRef.current;
-            if (!ms || ms.readyState !== 'open') return;
-
-            try {
-                const chunk = chunkQueueRef.current.shift();
-                sb.appendBuffer(chunk);
-            } catch (e) {
-                console.error('[player] appendBuffer error:', e.message);
-                // If QuotaExceededError, trim buffer aggressively and retry
-                if (e.name === 'QuotaExceededError') {
-                    console.log('[player] buffer full, trimming aggressively...');
-                    trimBuffer(10); // Keep only 10s behind
-                    // Re-queue the chunk for retry
-                    setTimeout(processQueue, 100);
-                }
-            }
-        };
-
-        const trimBuffer = (maxBehind = BUFFER_TRIM_THRESHOLD) => {
-            const sb = sourceBufferRef.current;
-            const video = videoRef?.current;
-            if (!sb || sb.updating || !video) return;
-
-            try {
-                const currentTime = video.currentTime;
-                if (sb.buffered.length > 0) {
-                    const bufferStart = sb.buffered.start(0);
-                    if (currentTime - bufferStart > maxBehind) {
-                        sb.remove(bufferStart, currentTime - maxBehind);
-                    }
-                }
-            } catch (e) {
-                // Ignore trim errors
-            }
-        };
-
-        return () => {
-            if (mediaSourceUrl) {
-                URL.revokeObjectURL(mediaSourceUrl);
-            }
-            mediaSourceRef.current = null;
-            sourceBufferRef.current = null;
-            chunkQueueRef.current = [];
-        };
-    }, [isHost, streamHandlersRef]);
     const [isLoading, setIsLoading] = useState(false);
+
     const [loadProgress, setLoadProgress] = useState(0);
     const [error, setError] = useState('');
     const [isDragging, setIsDragging] = useState(false);
@@ -383,7 +255,7 @@ export default function VideoPlayer({
     }
 
     // Viewer: downloading file from host (only show waiting screen if NO streaming source is ready)
-    if (!isHost && !movieBlobUrl && !mediaSourceUrl) {
+    if (!isHost && !movieBlobUrl) {
         return (
             <div className="player__waiting">
                 <div className="player__waiting-content">
@@ -399,6 +271,11 @@ export default function VideoPlayer({
                                 {downloadProgress}%
                                 {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
                             </span>
+                            {numPeers > 0 && (
+                                <p className="player__peers">
+                                    Connected to {numPeers} peer{numPeers !== 1 ? 's' : ''}
+                                </p>
+                            )}
                         </>
                     ) : (
                         <>
@@ -417,7 +294,7 @@ export default function VideoPlayer({
             <video
                 ref={videoRef}
                 className="player__video"
-                src={isHost ? localMovieUrl : (mediaSourceUrl || movieBlobUrl)}
+                src={isHost ? localMovieUrl : movieBlobUrl}
                 onLoadedMetadata={handleLoadedMetadata}
                 onPlay={handlePlay}
                 onPause={handlePause}

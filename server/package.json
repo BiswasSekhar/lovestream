@@ -9,10 +9,11 @@
         "build": "echo 'No build step'"
     },
     "dependencies": {
-        "express": "^4.21.2",
-        "socket.io": "^4.8.1",
+        "bittorrent-tracker": "^11.2.2",
         "cors": "^2.8.5",
         "dotenv": "^16.4.7",
-        "nanoid": "^5.1.2"
+        "express": "^4.21.2",
+        "nanoid": "^5.1.2",
+        "socket.io": "^4.8.1"
     }
 }

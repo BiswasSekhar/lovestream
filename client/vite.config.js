@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [
     react(),
     nodePolyfills({
-      include: ['process', 'buffer', 'stream', 'events', 'util'],
+      include: ['process', 'buffer', 'stream', 'events', 'util', 'path', 'crypto', 'http', 'https', 'url', 'zlib', 'timers', 'vm', 'tty', 'os', 'constants'],
       globals: {
         Buffer: true,
         global: true,
@@ -14,6 +14,11 @@ export default defineConfig({
       },
     }),
   ],
+  resolve: {
+    alias: {
+      webtorrent: 'webtorrent/dist/webtorrent.min.js',
+    },
+  },
   server: {
     port: 5173,
     host: true,
