@@ -86,7 +86,13 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
 
             // Binary chunk
             const chunk = rawData instanceof ArrayBuffer ? new Uint8Array(rawData) : rawData;
-            chunksRef.current.push(chunk);
+
+            // OPTIMIZATION: If onChunk is handled (MSE), don't buffer in memory
+            // This allows streaming large files (10GB+) without crashing the browser
+            if (!onChunk) {
+                chunksRef.current.push(chunk);
+            }
+
             receivedSizeRef.current += chunk.byteLength;
 
             // Streaming callback
@@ -101,13 +107,17 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
             // Check if complete
             if (receivedSizeRef.current >= expectedSizeRef.current) {
                 console.log('[filestream] file transfer complete!');
-                const blob = new Blob(chunksRef.current, { type: 'video/mp4' });
-                const url = URL.createObjectURL(blob);
-                console.log('[filestream] file transfer complete! blob size:', blob.size, 'url:', url);
-                setMovieBlobUrl(url);
+
+                if (!onChunk) {
+                    const blob = new Blob(chunksRef.current, { type: 'video/mp4' });
+                    const url = URL.createObjectURL(blob);
+                    console.log('[filestream] file transfer complete! blob size:', blob.size, 'url:', url);
+                    setMovieBlobUrl(url);
+                    chunksRef.current = []; // Free memory
+                }
+
                 setDownloadProgress(100);
                 setIsReceiving(false);
-                chunksRef.current = []; // Free memory
             }
         };
 
@@ -115,7 +125,7 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
         return () => {
             p.off('data', handleData);
         };
-    }, [peer.current, isHost]); // eslint-disable-line react-hooks/exhaustive-deps
+    }, [peer.current, isHost, onChunk]); // eslint-disable-line react-hooks/exhaustive-deps
 
     // Host: send a file over the data channel
     const sendFile = useCallback(
@@ -139,15 +149,15 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
                 });
                 p.send(meta);
 
-                // Read and send file in chunks
-                const arrayBuffer = await file.arrayBuffer();
-                const totalChunks = Math.ceil(arrayBuffer.byteLength / CHUNK_SIZE);
+                // Send file in chunks using slice() to avoid loading entire file into RAM
+                const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
                 let sent = 0;
 
                 for (let i = 0; i < totalChunks; i++) {
                     const start = i * CHUNK_SIZE;
-                    const end = Math.min(start + CHUNK_SIZE, arrayBuffer.byteLength);
-                    const chunk = arrayBuffer.slice(start, end);
+                    const end = Math.min(start + CHUNK_SIZE, file.size);
+                    const chunkBlob = file.slice(start, end);
+                    const chunkBuffer = await chunkBlob.arrayBuffer();
 
                     // Backpressure: wait if buffer is getting full
                     while (p._channel && p._channel.bufferedAmount > 1024 * 1024) {
@@ -161,10 +171,10 @@ export default function useFileStream({ peer, isHost, onChunk, onMeta }) {
                         return;
                     }
 
-                    p.send(new Uint8Array(chunk));
-                    sent += chunk.byteLength;
+                    p.send(new Uint8Array(chunkBuffer));
+                    sent += chunkBuffer.byteLength;
 
-                    const progress = Math.round((sent / arrayBuffer.byteLength) * 100);
+                    const progress = Math.round((sent / file.size) * 100);
                     setDownloadProgress(progress);
                 }
 
