@@ -278,6 +278,9 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
                         socket?.current?.emit('torrent-download-complete', {
                             name: videoFile?.name || sharedName || torrent.name,
                         });
+
+                        // Persist local playable source for post-download stability.
+                        createBlobUrlFallback(videoFile);
                     }
 
                     // Create blob fallback only if render-media never became ready.

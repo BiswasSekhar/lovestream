@@ -6,7 +6,7 @@ class RoomManager {
         this.socketToRoom = new Map();
     }
 
-    createRoom(socketId, participantId) {
+    createRoom(socketId, participantId, capabilities = {}) {
         const code = this.#generateUniqueCode();
         const room = {
             code,
@@ -16,6 +16,9 @@ class RoomManager {
             viewerParticipantId: null,
             hostDisconnectedAt: null,
             viewerDisconnectedAt: null,
+            hostCapabilities: this.#normalizeCapabilities(capabilities),
+            viewerCapabilities: { nativePlayback: false },
+            mode: 'web-compatible',
             createdAt: Date.now(),
             cache: {
                 movie: null,
@@ -31,7 +34,7 @@ class RoomManager {
         return room;
     }
 
-    joinRoom(code, socketId, participantId, { graceMs = 120000 } = {}) {
+    joinRoom(code, socketId, participantId, capabilities = {}, { graceMs = 120000 } = {}) {
         const room = this.rooms.get(code);
         if (!room) {
             return { error: 'Room not found. Check the code and try again.' };
@@ -43,10 +46,13 @@ class RoomManager {
         if (room.viewer === socketId) return { room, role: 'viewer' };
 
         const participant = participantId || null;
+        const caps = this.#normalizeCapabilities(capabilities);
 
         if (!room.host && room.hostParticipantId && participant && room.hostParticipantId === participant) {
             room.host = socketId;
             room.hostDisconnectedAt = null;
+            room.hostCapabilities = caps;
+            this.#recomputeRoomMode(room);
             this.socketToRoom.set(socketId, code);
             return { room, role: 'host', reclaimed: true };
         }
@@ -54,6 +60,8 @@ class RoomManager {
         if (!room.viewer && room.viewerParticipantId && participant && room.viewerParticipantId === participant) {
             room.viewer = socketId;
             room.viewerDisconnectedAt = null;
+            room.viewerCapabilities = caps;
+            this.#recomputeRoomMode(room);
             this.socketToRoom.set(socketId, code);
             return { room, role: 'viewer', reclaimed: true };
         }
@@ -66,6 +74,8 @@ class RoomManager {
             room.viewer = socketId;
             room.viewerParticipantId = participant;
             room.viewerDisconnectedAt = null;
+            room.viewerCapabilities = caps;
+            this.#recomputeRoomMode(room);
             this.socketToRoom.set(socketId, code);
             return { room, role: 'viewer' };
         }
@@ -95,6 +105,8 @@ class RoomManager {
             room.viewer = null;
             room.viewerDisconnectedAt = Date.now();
         }
+
+        this.#recomputeRoomMode(room);
 
         return { code, role, peerSocketId };
     }
@@ -155,16 +167,30 @@ class RoomManager {
         return room.cache || null;
     }
 
+    getRoomMode(code) {
+        const room = this.rooms.get(code);
+        return room?.mode || 'web-compatible';
+    }
+
+    getRoomModeBySocket(socketId) {
+        const room = this.getRoomBySocket(socketId);
+        return room?.mode || 'web-compatible';
+    }
+
     #pruneRoomReservations(room, graceMs, now = Date.now()) {
         if (!room.host && room.hostParticipantId && room.hostDisconnectedAt && now - room.hostDisconnectedAt > graceMs) {
             room.hostParticipantId = null;
             room.hostDisconnectedAt = null;
+            room.hostCapabilities = { nativePlayback: false };
         }
 
         if (!room.viewer && room.viewerParticipantId && room.viewerDisconnectedAt && now - room.viewerDisconnectedAt > graceMs) {
             room.viewerParticipantId = null;
             room.viewerDisconnectedAt = null;
+            room.viewerCapabilities = { nativePlayback: false };
         }
+
+        this.#recomputeRoomMode(room);
     }
 
     #generateUniqueCode() {
@@ -173,6 +199,18 @@ class RoomManager {
             code = nanoid(6).toUpperCase();
         }
         return code;
+    }
+
+    #normalizeCapabilities(capabilities = {}) {
+        return {
+            nativePlayback: Boolean(capabilities.nativePlayback),
+        };
+    }
+
+    #recomputeRoomMode(room) {
+        const bothConnected = Boolean(room.host && room.viewer && !room.hostDisconnectedAt && !room.viewerDisconnectedAt);
+        const bothNative = Boolean(room.hostCapabilities?.nativePlayback) && Boolean(room.viewerCapabilities?.nativePlayback);
+        room.mode = bothConnected && bothNative ? 'native' : 'web-compatible';
     }
 }
 

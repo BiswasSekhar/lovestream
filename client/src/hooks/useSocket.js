@@ -23,6 +23,16 @@ function resolveServerUrl() {
 const SERVER_URL = resolveServerUrl();
 const PARTICIPANT_ID_KEY = 'lovestream.participantId';
 
+function getClientCapabilities() {
+    try {
+        return {
+            nativePlayback: Boolean(window?.electron?.platform),
+        };
+    } catch {
+        return { nativePlayback: false };
+    }
+}
+
 function getOrCreateParticipantId() {
     try {
         let participantId = localStorage.getItem(PARTICIPANT_ID_KEY);
@@ -90,8 +100,11 @@ export default function useSocket() {
     const createRoom = useCallback(() => {
         return new Promise((resolve, reject) => {
             if (!socketRef.current) return reject(new Error('Not connected'));
-            socketRef.current.emit('create-room', { participantId: getOrCreateParticipantId() }, (response) => {
-                if (response.success) resolve(response.room);
+            socketRef.current.emit('create-room', {
+                participantId: getOrCreateParticipantId(),
+                capabilities: getClientCapabilities(),
+            }, (response) => {
+                if (response.success) resolve({ ...response.room, mode: response.mode || 'web-compatible' });
                 else reject(new Error(response.error));
             });
         });
@@ -100,8 +113,12 @@ export default function useSocket() {
     const joinRoom = useCallback((code) => {
         return new Promise((resolve, reject) => {
             if (!socketRef.current) return reject(new Error('Not connected'));
-            socketRef.current.emit('join-room', { code, participantId: getOrCreateParticipantId() }, (response) => {
-                if (response.success) resolve(response.room);
+            socketRef.current.emit('join-room', {
+                code,
+                participantId: getOrCreateParticipantId(),
+                capabilities: getClientCapabilities(),
+            }, (response) => {
+                if (response.success) resolve({ ...response.room, mode: response.mode || 'web-compatible' });
                 else reject(new Error(response.error));
             });
         });
@@ -112,5 +129,7 @@ export default function useSocket() {
         isConnected,
         createRoom,
         joinRoom,
+        getParticipantId: getOrCreateParticipantId,
+        getClientCapabilities,
     };
 }

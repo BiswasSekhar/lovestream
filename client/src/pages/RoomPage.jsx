@@ -12,6 +12,38 @@ import Chat from '../components/Room/Chat.jsx';
 import Subtitles from '../components/Room/Subtitles.jsx';
 
 const roomRoleKey = (code) => `lovestream.role.${code}`;
+const roomRoleMetaKey = (code) => `lovestream.role.meta.${code}`;
+const DEFAULT_RECONNECT_GRACE_MS = 2 * 60 * 1000;
+
+function getStoredRoomRole(code) {
+    try {
+        const role = localStorage.getItem(roomRoleKey(code));
+        const rawMeta = localStorage.getItem(roomRoleMetaKey(code));
+        if (!role) return null;
+
+        if (rawMeta) {
+            const meta = JSON.parse(rawMeta);
+            if (meta?.expiresAt && Date.now() > meta.expiresAt) {
+                localStorage.removeItem(roomRoleKey(code));
+                localStorage.removeItem(roomRoleMetaKey(code));
+                return null;
+            }
+        }
+
+        return role;
+    } catch {
+        return null;
+    }
+}
+
+function setStoredRoomRole(code, role, ttlMs = DEFAULT_RECONNECT_GRACE_MS) {
+    try {
+        localStorage.setItem(roomRoleKey(code), role);
+        localStorage.setItem(roomRoleMetaKey(code), JSON.stringify({
+            expiresAt: Date.now() + Math.max(1000, ttlMs),
+        }));
+    } catch { }
+}
 
 function RoomContent() {
     const { roomCode } = useParams();
@@ -20,16 +52,12 @@ function RoomContent() {
     const [role, setRole] = useState(() => {
         const fromNav = location.state?.role;
         if (fromNav) return fromNav;
-        try {
-            return localStorage.getItem(roomRoleKey(roomCode)) || 'viewer';
-        } catch {
-            return 'viewer';
-        }
+        return getStoredRoomRole(roomCode) || 'viewer';
     });
     const isHost = role === 'host';
 
     const { state, dispatch } = useRoom();
-    const { socket, isConnected } = useSocket();
+    const { socket, isConnected, getParticipantId, getClientCapabilities } = useSocket();
     const { localStream, cameraOn, micOn, permissionError, startMedia, stopMedia, toggleCamera, toggleMic } =
         useMediaDevices();
 
@@ -48,12 +76,11 @@ function RoomContent() {
     const [downloadCompleteToast, setDownloadCompleteToast] = useState('');
     const [partnerDisconnected, setPartnerDisconnected] = useState(false);
     const [allowSoloPlayback, setAllowSoloPlayback] = useState(false);
+    const [roomMode, setRoomMode] = useState('web-compatible');
     const autoStartedRef = useRef(false);
 
     useEffect(() => {
-        try {
-            localStorage.setItem(roomRoleKey(roomCode), role);
-        } catch { }
+        setStoredRoomRole(roomCode, role, DEFAULT_RECONNECT_GRACE_MS);
     }, [roomCode, role]);
 
     // WebRTC (video call only — no movie stream)
@@ -157,21 +184,41 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock || !isConnected || !mediaReady) return;
 
-        sock.emit('join-room', { code: roomCode }, (response) => {
+        sock.emit('join-room', {
+            code: roomCode,
+            participantId: getParticipantId(),
+            capabilities: getClientCapabilities(),
+        }, (response) => {
             if (!response.success) {
                 console.error('[room] failed to join:', response.error);
                 return;
             }
 
             const serverRole = response?.room?.role;
+            const mode = response?.mode || 'web-compatible';
+            const reconnectGraceMs = response?.reconnectGraceMs || DEFAULT_RECONNECT_GRACE_MS;
+            setRoomMode(mode);
             if (serverRole === 'host' || serverRole === 'viewer') {
+                setStoredRoomRole(roomCode, serverRole, reconnectGraceMs);
                 setRole(serverRole);
             }
 
             console.log('[room] joined/rejoined, emitting ready-for-connection');
             sock.emit('ready-for-connection');
         });
-    }, [isConnected, roomCode, socket, mediaReady]);
+    }, [isConnected, roomCode, socket, mediaReady, getParticipantId, getClientCapabilities]);
+
+    useEffect(() => {
+        const sock = socket.current;
+        if (!sock) return;
+
+        const handleRoomMode = ({ mode }) => {
+            setRoomMode(mode || 'web-compatible');
+        };
+
+        sock.on('room-mode', handleRoomMode);
+        return () => sock.off('room-mode', handleRoomMode);
+    }, [socket]);
 
     useEffect(() => {
         const sock = socket.current;
@@ -181,6 +228,9 @@ function RoomContent() {
             setPartnerDisconnected(true);
             setViewerPlayableReady(false);
             autoStartedRef.current = false;
+
+            // Stop/clear transfer state so next rejoin starts cleanly.
+            resetTransferState();
 
             // Pause local playback when partner disconnects.
             const v = activeVideoRef.current;
@@ -196,7 +246,7 @@ function RoomContent() {
 
         sock.on('peer-left', handlePeerLeft);
         return () => sock.off('peer-left', handlePeerLeft);
-    }, [socket, activeVideoRef, isHost]);
+    }, [socket, activeVideoRef, isHost, resetTransferState]);
 
     // Listen for subtitle data from host
     useEffect(() => {
@@ -423,6 +473,9 @@ function RoomContent() {
                     </div>
                 </div>
                 <div className="room__header-right">
+                    <span className="room__movie-name" title={`Room mode: ${roomMode}`}>
+                        {roomMode === 'native' ? '🖥️ Native Mode' : '🌐 Web Mode'}
+                    </span>
                     {state.movieName && (
                         <span className="room__movie-name" title={state.movieName}>
                             🎬 {state.movieName}

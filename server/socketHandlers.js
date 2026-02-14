@@ -15,21 +15,23 @@ export default function registerSocketHandlers(io, roomManager) {
             const callback = typeof payloadOrCb === 'function' ? payloadOrCb : maybeCb;
             const payload = typeof payloadOrCb === 'function' ? {} : (payloadOrCb || {});
             const participantId = payload.participantId || null;
+            const capabilities = payload.capabilities || {};
 
-            const room = roomManager.createRoom(socket.id, participantId);
+            const room = roomManager.createRoom(socket.id, participantId, capabilities);
             socket.join(room.code);
             console.log(`[room] ${socket.id} created room ${room.code}`);
             callback?.({
                 success: true,
                 room: { code: room.code, role: 'host' },
+                mode: room.mode,
                 reconnectGraceMs: RECONNECT_GRACE_MS,
             });
         });
 
-        socket.on('join-room', ({ code, participantId } = {}, callback) => {
+        socket.on('join-room', ({ code, participantId, capabilities } = {}, callback) => {
             const normalizedCode = (code || '').trim().toUpperCase();
             roomManager.cleanupExpired(RECONNECT_GRACE_MS);
-            const result = roomManager.joinRoom(normalizedCode, socket.id, participantId || null, {
+            const result = roomManager.joinRoom(normalizedCode, socket.id, participantId || null, capabilities || {}, {
                 graceMs: RECONNECT_GRACE_MS,
             });
 
@@ -44,8 +46,11 @@ export default function registerSocketHandlers(io, roomManager) {
             callback?.({
                 success: true,
                 room: { code: normalizedCode, role: result.role || 'viewer' },
+                mode: roomManager.getRoomMode(normalizedCode),
                 reconnectGraceMs: RECONNECT_GRACE_MS,
             });
+
+            io.in(normalizedCode).emit('room-mode', { mode: roomManager.getRoomMode(normalizedCode) });
 
             // Replay cached room state to reconnecting/joining peer.
             const snapshot = roomManager.getRoomSnapshot(normalizedCode);
@@ -240,13 +245,14 @@ export default function registerSocketHandlers(io, roomManager) {
             readySockets.delete(socket.id);
             const result = roomManager.leaveRoom(socket.id);
             if (result) {
-                const { role, peerSocketId } = result;
+                const { code, role, peerSocketId } = result;
                 if (peerSocketId) {
                     io.to(peerSocketId).emit('peer-left', {
                         role,
                         temporary: false,
                     });
                 }
+                io.in(code).emit('room-mode', { mode: roomManager.getRoomMode(code) });
             }
         });
 
@@ -264,6 +270,7 @@ export default function registerSocketHandlers(io, roomManager) {
                         reconnectGraceMs: RECONNECT_GRACE_MS,
                     });
                 }
+                io.in(code).emit('room-mode', { mode: roomManager.getRoomMode(code) });
             }
         });
     });
