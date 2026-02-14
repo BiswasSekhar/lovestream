@@ -192,4 +192,9 @@ httpServer.listen(PORT, () => {
     });
 
     console.log(`   WebTorrent tracker ready on ws://localhost:${PORT}`);
+
+    // Keep alive — prevent Render free-tier idle shutdown (~15 min inactivity spin-down)
+    setInterval(() => {
+        fetch(`http://localhost:${PORT}/health`).catch(() => { });
+    }, 10 * 60 * 1000); // every 10 minutes
 });

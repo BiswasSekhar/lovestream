@@ -204,13 +204,30 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock || !isConnected || !mediaReady) return;
 
-        sock.emit('join-room', {
-            code: roomCode,
-            participantId: getParticipantId(),
-            capabilities: getClientCapabilities(),
-        }, (response) => {
+        const handleJoinResponse = (response) => {
             if (!response.success) {
                 console.error('[room] failed to join:', response.error);
+
+                // If room not found (server restarted), host re-creates it
+                if (isHost && /not found/i.test(response.error || '')) {
+                    console.log('[room] server lost room state — host re-creating room', roomCode);
+                    sock.emit('create-room', {
+                        participantId: getParticipantId(),
+                        capabilities: getClientCapabilities(),
+                        requestedCode: roomCode,
+                    }, (createResp) => {
+                        if (createResp.success) {
+                            console.log('[room] room re-created, joining…');
+                            sock.emit('join-room', {
+                                code: roomCode,
+                                participantId: getParticipantId(),
+                                capabilities: getClientCapabilities(),
+                            }, handleJoinResponse);
+                        } else {
+                            console.error('[room] re-create failed:', createResp.error);
+                        }
+                    });
+                }
                 return;
             }
 
@@ -225,8 +242,14 @@ function RoomContent() {
 
             console.log('[room] joined/rejoined, emitting ready-for-connection');
             sock.emit('ready-for-connection');
-        });
-    }, [isConnected, roomCode, socket, mediaReady, getParticipantId, getClientCapabilities]);
+        };
+
+        sock.emit('join-room', {
+            code: roomCode,
+            participantId: getParticipantId(),
+            capabilities: getClientCapabilities(),
+        }, handleJoinResponse);
+    }, [isConnected, roomCode, socket, mediaReady, isHost, getParticipantId, getClientCapabilities]);
 
     useEffect(() => {
         const sock = socket.current;

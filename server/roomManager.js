@@ -6,8 +6,15 @@ class RoomManager {
         this.socketToRoom = new Map();
     }
 
-    createRoom(socketId, participantId, capabilities = {}) {
-        const code = this.#generateUniqueCode();
+    createRoom(socketId, participantId, capabilities = {}, requestedCode = null) {
+        // Use requested code if provided and not already taken (e.g. host re-creating after server restart)
+        let code;
+        if (requestedCode) {
+            const normalized = requestedCode.trim().toUpperCase();
+            code = this.rooms.has(normalized) ? this.#generateUniqueCode() : normalized;
+        } else {
+            code = this.#generateUniqueCode();
+        }
         const room = {
             code,
             host: socketId,

@@ -17,7 +17,7 @@ export default function registerSocketHandlers(io, roomManager) {
             const participantId = payload.participantId || null;
             const capabilities = payload.capabilities || {};
 
-            const room = roomManager.createRoom(socket.id, participantId, capabilities);
+            const room = roomManager.createRoom(socket.id, participantId, capabilities, payload.requestedCode);
             socket.join(room.code);
             console.log(`[room] ${socket.id} created room ${room.code}`);
             callback?.({
@@ -118,22 +118,26 @@ export default function registerSocketHandlers(io, roomManager) {
         // ─── Playback Sync ──────────────────────────────────────
         socket.on('sync-play', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (room) {
-                roomManager.updateRoomCache(room.code, {
-                    playback: { type: 'play', time, actionId, updatedAt: Date.now() },
-                });
-                socket.to(room.code).emit('sync-play', { time, actionId, from: socket.id });
+            if (!room) {
+                console.warn(`[sync] sync-play from ${socket.id} but no room found (server may have restarted)`);
+                return;
             }
+            roomManager.updateRoomCache(room.code, {
+                playback: { type: 'play', time, actionId, updatedAt: Date.now() },
+            });
+            socket.to(room.code).emit('sync-play', { time, actionId, from: socket.id });
         });
 
         socket.on('sync-pause', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (room) {
-                roomManager.updateRoomCache(room.code, {
-                    playback: { type: 'pause', time, actionId, updatedAt: Date.now() },
-                });
-                socket.to(room.code).emit('sync-pause', { time, actionId, from: socket.id });
+            if (!room) {
+                console.warn(`[sync] sync-pause from ${socket.id} but no room found (server may have restarted)`);
+                return;
             }
+            roomManager.updateRoomCache(room.code, {
+                playback: { type: 'pause', time, actionId, updatedAt: Date.now() },
+            });
+            socket.to(room.code).emit('sync-pause', { time, actionId, from: socket.id });
         });
 
         socket.on('sync-seek', ({ time, actionId }) => {
@@ -149,7 +153,11 @@ export default function registerSocketHandlers(io, roomManager) {
         // ─── Chat ────────────────────────────────────────────────
         socket.on('chat-message', ({ text }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (room && text && text.trim()) {
+            if (!room) {
+                console.warn(`[chat] chat-message from ${socket.id} but no room found (server may have restarted)`);
+                return;
+            }
+            if (text && text.trim()) {
                 const role = roomManager.getRoleInRoom(socket.id);
                 const message = {
                     id: `${socket.id}-${Date.now()}`,

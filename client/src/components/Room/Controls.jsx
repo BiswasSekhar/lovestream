@@ -115,7 +115,7 @@ export default function Controls({ videoRef, isHost, playbackSync, onSubtitleFil
 
     // Fullscreen
     const toggleFullscreen = useCallback(() => {
-        const playerEl = videoRef.current?.closest('.player') || videoRef.current?.closest('.room__player-area');
+        const playerEl = videoRef.current?.closest('.room__player-area') || videoRef.current?.closest('.player');
         if (!playerEl) return;
 
         if (document.fullscreenElement) {
