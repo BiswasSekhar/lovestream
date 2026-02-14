@@ -3,25 +3,36 @@
  * @param {string} text - Raw SRT file content
  * @returns {Array<{id: number, start: number, end: number, text: string}>}
  */
-export function parseSRT(text) {
+export function parseSRT(rawText) {
     const cues = [];
-    const blocks = text.trim().replace(/\r\n/g, '\n').split(/\n\n+/);
+    // Strip BOM and normalise all line-ending variants (\r\n, \r, \n)
+    const text = rawText.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+    const blocks = text.split(/\n\n+/);
 
     for (const block of blocks) {
         const lines = block.split('\n');
-        if (lines.length < 3) continue;
+        if (lines.length < 2) continue;
 
-        const id = parseInt(lines[0], 10);
-        const timeMatch = lines[1].match(
-            /(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/
+        // Find the timestamp line — it may be line 0 (no index) or line 1
+        let tsLineIdx = -1;
+        for (let i = 0; i < Math.min(lines.length, 2); i++) {
+            if (/-->/.test(lines[i])) { tsLineIdx = i; break; }
+        }
+        if (tsLineIdx === -1) continue;
+
+        const timeMatch = lines[tsLineIdx].match(
+            /(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{1,2}):(\d{2}):(\d{2})[,.](\d{3})/
         );
         if (!timeMatch) continue;
 
+        const id = tsLineIdx > 0 ? parseInt(lines[0], 10) || cues.length + 1 : cues.length + 1;
         const start = timeToSeconds(timeMatch[1], timeMatch[2], timeMatch[3], timeMatch[4]);
         const end = timeToSeconds(timeMatch[5], timeMatch[6], timeMatch[7], timeMatch[8]);
-        const text = lines.slice(2).join('\n').replace(/<[^>]+>/g, ''); // Strip HTML tags
+        const cueText = lines.slice(tsLineIdx + 1).join('\n').replace(/<[^>]+>/g, '').trim();
 
-        cues.push({ id, start, end, text });
+        if (cueText) {
+            cues.push({ id, start, end, text: cueText });
+        }
     }
 
     return cues;
@@ -32,9 +43,9 @@ export function parseSRT(text) {
  * @param {string} text - Raw ASS file content
  * @returns {Array<{id: number, start: number, end: number, text: string, style: string}>}
  */
-export function parseASS(text) {
+export function parseASS(rawText) {
     const cues = [];
-    const lines = text.replace(/\r\n/g, '\n').split('\n');
+    const lines = rawText.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
 
     let inEvents = false;
     let formatFields = [];

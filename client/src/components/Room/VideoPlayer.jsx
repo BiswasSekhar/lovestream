@@ -16,6 +16,7 @@ export default function VideoPlayer({
     downloadProgress,
     transferSpeed,
     numPeers,
+    isSending,
     isReceiving,
     onFileReady,
     onTimeUpdate,
@@ -127,7 +128,10 @@ export default function VideoPlayer({
             refreshLibrary();
         } catch (err) {
             console.error('[player] failed to save to library:', err);
-            setError(`Failed to save to library: ${err.message}`);
+            const isQuota = /quota|blob|IOError/i.test(err?.message || '');
+            setError(isQuota
+                ? 'File too large to save — browser storage quota exceeded'
+                : `Failed to save to library: ${err.message}`);
             setShowSaveOffer(null);
         }
     }, [clearCompletedDownload, refreshLibrary]);
@@ -393,14 +397,18 @@ export default function VideoPlayer({
                 selectedFileRef.current = processedFile;
                 setIsLoading(false);
 
-                await saveTempMedia({
-                    roomCode,
-                    role: 'host',
-                    blob: processedFile,
-                    fileName: processedFile.name,
-                    sourcePath: file.path || null,
-                    ttlMs: TEMP_MEDIA_TTL_MS,
-                });
+                try {
+                    await saveTempMedia({
+                        roomCode,
+                        role: 'host',
+                        blob: processedFile,
+                        fileName: processedFile.name,
+                        sourcePath: file.path || null,
+                        ttlMs: TEMP_MEDIA_TTL_MS,
+                    });
+                } catch (cacheErr) {
+                    console.warn('[player] temp cache save skipped (quota?):', cacheErr.message);
+                }
 
                 socket.current?.emit('movie-loaded', {
                     name: file.name,
@@ -679,6 +687,14 @@ export default function VideoPlayer({
 
             {error && <div className="player__error">{error}</div>}
             {playbackNotice && <div className="player__error">{playbackNotice}</div>}
+
+            {/* Host seeding spinner */}
+            {isHost && isSending && (
+                <div className="player__seeding-overlay">
+                    <div className="player__spinner-large" />
+                    <span>Seeding to partner…</span>
+                </div>
+            )}
 
             {/* Save to Library offer */}
             {showSaveOffer && (

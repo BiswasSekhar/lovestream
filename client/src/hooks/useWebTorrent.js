@@ -101,13 +101,17 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                 setMovieBlobUrl(url);
 
                 if (!isHost && roomCode) {
-                    await saveTempMedia({
-                        roomCode,
-                        role: 'viewer',
-                        blob,
-                        fileName: videoFile.name || 'movie.mp4',
-                        ttlMs: TEMP_MEDIA_TTL_MS,
-                    });
+                    try {
+                        await saveTempMedia({
+                            roomCode,
+                            role: 'viewer',
+                            blob,
+                            fileName: videoFile.name || 'movie.mp4',
+                            ttlMs: TEMP_MEDIA_TTL_MS,
+                        });
+                    } catch (cacheErr) {
+                        console.warn('[webtorrent] temp cache save skipped (quota?):', cacheErr.message);
+                    }
                 }
                 return;
             }

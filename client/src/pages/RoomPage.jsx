@@ -530,6 +530,7 @@ function RoomContent() {
                         downloadProgress={downloadProgress}
                         transferSpeed={transferSpeed}
                         numPeers={numPeers}
+                        isSending={isSending}
                         isReceiving={isReceiving}
                         onFileReady={handleFileReady}
                         onTimeUpdate={handleTimeUpdate}
