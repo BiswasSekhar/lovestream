@@ -2,6 +2,20 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+const PARTICIPANT_ID_KEY = 'lovestream.participantId';
+
+function getOrCreateParticipantId() {
+    try {
+        let participantId = localStorage.getItem(PARTICIPANT_ID_KEY);
+        if (!participantId) {
+            participantId = `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+            localStorage.setItem(PARTICIPANT_ID_KEY, participantId);
+        }
+        return participantId;
+    } catch {
+        return `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+    }
+}
 
 // Module-level singleton — NEVER disconnects during app lifecycle
 let sharedSocket = null;
@@ -55,7 +69,7 @@ export default function useSocket() {
     const createRoom = useCallback(() => {
         return new Promise((resolve, reject) => {
             if (!socketRef.current) return reject(new Error('Not connected'));
-            socketRef.current.emit('create-room', (response) => {
+            socketRef.current.emit('create-room', { participantId: getOrCreateParticipantId() }, (response) => {
                 if (response.success) resolve(response.room);
                 else reject(new Error(response.error));
             });
@@ -65,7 +79,7 @@ export default function useSocket() {
     const joinRoom = useCallback((code) => {
         return new Promise((resolve, reject) => {
             if (!socketRef.current) return reject(new Error('Not connected'));
-            socketRef.current.emit('join-room', { code }, (response) => {
+            socketRef.current.emit('join-room', { code, participantId: getOrCreateParticipantId() }, (response) => {
                 if (response.success) resolve(response.room);
                 else reject(new Error(response.error));
             });

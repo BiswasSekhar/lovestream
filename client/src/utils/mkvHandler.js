@@ -52,9 +52,10 @@ export async function loadFFmpeg(onProgress) {
  * @param {Function} onProgress - Progress callback (0-100)
  * @returns {Promise<{url: string, isHevc: boolean, mime: string}>} Result object
  */
-export async function transmuxToFMP4(file, onProgress) {
+export async function transmuxToFMP4(file, onProgress, options = {}) {
     const ffmpeg = await loadFFmpeg(onProgress);
     const { fetchFile } = await import('@ffmpeg/util');
+    const forceH264 = Boolean(options.forceH264);
 
     const ext = file.name.split('.').pop();
     const inputName = `input.${ext}`;
@@ -110,23 +111,37 @@ export async function transmuxToFMP4(file, onProgress) {
         }
     });
 
-    // Remux to fMP4 (fragmented)
-    // Always transcode audio to AAC for MSE compatibility
-    // Copy video codec (no re-encoding) for speed
-    await ffmpeg.exec([
-        '-i', inputName,
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        outputName,
-    ]);
+    // Remux/transcode to fMP4 (fragmented)
+    // Always transcode audio to AAC for MSE compatibility.
+    // Video: copy by default (fast), or transcode to H.264 when forceH264 is enabled.
+    const ffmpegArgs = forceH264
+        ? [
+            '-i', inputName,
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '23',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            outputName,
+        ]
+        : [
+            '-i', inputName,
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            outputName,
+        ];
+
+    await ffmpeg.exec(ffmpegArgs);
 
     const data = await ffmpeg.readFile(outputName);
 
     // Create blob with CORRECT codec string (or generic)
     // If HEVC, browser might still fail if no hardware support.
-    const detectedCodec = `${detectedVideoCodec},${detectedAudioCodec}`;
+    const detectedCodec = forceH264 ? `avc1.640028,${detectedAudioCodec}` : `${detectedVideoCodec},${detectedAudioCodec}`;
     const mime = `video/mp4; codecs="${detectedCodec}"`;
     const blob = new Blob([data.buffer], { type: mime });
     const url = URL.createObjectURL(blob);
@@ -135,7 +150,7 @@ export async function transmuxToFMP4(file, onProgress) {
     await ffmpeg.deleteFile(inputName);
     await ffmpeg.deleteFile(outputName);
 
-    return { url, isHevc, mime };
+    return { url, isHevc, mime, transcodedVideo: forceH264 };
 }
 
 /**

@@ -12,7 +12,7 @@ import { createFile as createMP4Box } from 'mp4box';
  * 
  * @param {File} file - The MP4 file to fragment
  * @param {Function} onProgress - Progress callback (0-100)
- * @returns {Promise<{url: string, mime: string, isHevc: boolean}>}
+ * @returns {Promise<{url: string, blob: Blob, mime: string, isHevc: boolean}>}
  */
 export async function fragmentMP4(file, onProgress) {
     return new Promise((resolve, reject) => {
@@ -132,7 +132,7 @@ export async function fragmentMP4(file, onProgress) {
                 const blob = new Blob(chunks, { type: mime });
                 const url = URL.createObjectURL(blob);
 
-                resolve({ url, mime, isHevc });
+                resolve({ url, blob, mime, isHevc });
             } catch (err) {
                 reject(err);
             }

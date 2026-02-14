@@ -1,34 +1,63 @@
 export default function registerSocketHandlers(io, roomManager) {
     // Track which sockets are ready for WebRTC
     const readySockets = new Set();
+    const RECONNECT_GRACE_MS = 2 * 60 * 1000;
+
+    setInterval(() => {
+        roomManager.cleanupExpired(RECONNECT_GRACE_MS);
+    }, 30000);
 
     io.on('connection', (socket) => {
         console.log(`[connect] ${socket.id}`);
 
         // ─── Room Events ─────────────────────────────────────────
-        socket.on('create-room', (callback) => {
-            const room = roomManager.createRoom(socket.id);
+        socket.on('create-room', (payloadOrCb, maybeCb) => {
+            const callback = typeof payloadOrCb === 'function' ? payloadOrCb : maybeCb;
+            const payload = typeof payloadOrCb === 'function' ? {} : (payloadOrCb || {});
+            const participantId = payload.participantId || null;
+
+            const room = roomManager.createRoom(socket.id, participantId);
             socket.join(room.code);
             console.log(`[room] ${socket.id} created room ${room.code}`);
-            callback({ success: true, room: { code: room.code, role: 'host' } });
+            callback?.({
+                success: true,
+                room: { code: room.code, role: 'host' },
+                reconnectGraceMs: RECONNECT_GRACE_MS,
+            });
         });
 
-        socket.on('join-room', ({ code }, callback) => {
+        socket.on('join-room', ({ code, participantId } = {}, callback) => {
             const normalizedCode = (code || '').trim().toUpperCase();
-            const result = roomManager.joinRoom(normalizedCode, socket.id);
+            roomManager.cleanupExpired(RECONNECT_GRACE_MS);
+            const result = roomManager.joinRoom(normalizedCode, socket.id, participantId || null, {
+                graceMs: RECONNECT_GRACE_MS,
+            });
 
             if (result.error) {
-                callback({ success: false, error: result.error });
+                callback?.({ success: false, error: result.error });
                 return;
             }
 
             socket.join(normalizedCode);
             console.log(`[room] ${socket.id} joined room ${normalizedCode}`);
 
-            callback({
+            callback?.({
                 success: true,
-                room: { code: normalizedCode, role: 'viewer' },
+                room: { code: normalizedCode, role: result.role || 'viewer' },
+                reconnectGraceMs: RECONNECT_GRACE_MS,
             });
+
+            // Replay cached room state to reconnecting/joining peer.
+            const snapshot = roomManager.getRoomSnapshot(normalizedCode);
+            if (snapshot?.movie) {
+                io.to(socket.id).emit('movie-loaded', snapshot.movie);
+            }
+            if (snapshot?.subtitles) {
+                io.to(socket.id).emit('subtitle-data', snapshot.subtitles);
+            }
+            if (snapshot?.magnet) {
+                io.to(socket.id).emit('torrent-magnet', snapshot.magnet);
+            }
         });
 
         // Client emits this when its WebRTC hooks are fully set up
@@ -82,6 +111,9 @@ export default function registerSocketHandlers(io, roomManager) {
         socket.on('sync-play', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
+                roomManager.updateRoomCache(room.code, {
+                    playback: { type: 'play', time, actionId, updatedAt: Date.now() },
+                });
                 socket.to(room.code).emit('sync-play', { time, actionId, from: socket.id });
             }
         });
@@ -89,6 +121,9 @@ export default function registerSocketHandlers(io, roomManager) {
         socket.on('sync-pause', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
+                roomManager.updateRoomCache(room.code, {
+                    playback: { type: 'pause', time, actionId, updatedAt: Date.now() },
+                });
                 socket.to(room.code).emit('sync-pause', { time, actionId, from: socket.id });
             }
         });
@@ -96,6 +131,9 @@ export default function registerSocketHandlers(io, roomManager) {
         socket.on('sync-seek', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
+                roomManager.updateRoomCache(room.code, {
+                    playback: { type: 'seek', time, actionId, updatedAt: Date.now() },
+                });
                 socket.to(room.code).emit('sync-seek', { time, actionId, from: socket.id });
             }
         });
@@ -117,6 +155,13 @@ export default function registerSocketHandlers(io, roomManager) {
 
         // ─── Subtitle sharing ───────────────────────────────────
         socket.on('subtitle-data', ({ subtitles, filename }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                roomManager.updateRoomCache(room.code, {
+                    subtitles: { subtitles, filename },
+                });
+            }
+
             const peerId = roomManager.getPeerSocketId(socket.id);
             if (peerId) {
                 io.to(peerId).emit('subtitle-data', { subtitles, filename });
@@ -127,6 +172,9 @@ export default function registerSocketHandlers(io, roomManager) {
         socket.on('movie-loaded', ({ name, duration }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
+                roomManager.updateRoomCache(room.code, {
+                    movie: { name, duration },
+                });
                 socket.to(room.code).emit('movie-loaded', { name, duration });
             }
         });
@@ -142,12 +190,37 @@ export default function registerSocketHandlers(io, roomManager) {
             }
         });
 
-        // ─── WebTorrent magnet sharing ──────────────────────────
-        socket.on('torrent-magnet', ({ magnetURI }) => {
+        socket.on('viewer-playable', ({ timestamp }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
+                socket.to(room.code).emit('viewer-playable', {
+                    timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
+                    from: socket.id,
+                });
+            }
+        });
+
+        // ─── WebTorrent magnet sharing ──────────────────────────
+        socket.on('torrent-magnet', ({ magnetURI, preTranscode, name }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                // Cache only finalized playable magnet for reconnect replay.
+                if (!preTranscode) {
+                    roomManager.updateRoomCache(room.code, {
+                        magnet: {
+                            magnetURI,
+                            preTranscode: false,
+                            name: name || '',
+                        },
+                    });
+                }
+
                 console.log(`[torrent] ${socket.id} sharing magnet in room ${room.code}`);
-                socket.to(room.code).emit('torrent-magnet', { magnetURI });
+                socket.to(room.code).emit('torrent-magnet', {
+                    magnetURI,
+                    preTranscode: Boolean(preTranscode),
+                    name: name || '',
+                });
             }
         });
 
@@ -157,9 +230,13 @@ export default function registerSocketHandlers(io, roomManager) {
             readySockets.delete(socket.id);
             const result = roomManager.leaveRoom(socket.id);
             if (result) {
-                const { code, peerSocketId, newRole } = result;
+                const { code, role, peerSocketId } = result;
                 if (peerSocketId) {
-                    io.to(peerSocketId).emit('peer-left', { newRole });
+                    io.to(peerSocketId).emit('peer-left', {
+                        role,
+                        temporary: true,
+                        reconnectGraceMs: RECONNECT_GRACE_MS,
+                    });
                 }
             }
         });

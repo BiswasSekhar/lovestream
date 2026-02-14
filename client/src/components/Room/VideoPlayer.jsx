@@ -6,32 +6,32 @@ import Controls from './Controls.jsx';
 
 export default function VideoPlayer({
     isHost,
-    peerBufferedReady = true,
+    peerPlayableReady = true,
     videoRef,
-    movieBlobUrl,       // Viewer: blob URL from data channel transfer
-    downloadProgress,   // Viewer: 0-100 download progress
-    transferSpeed,      // Viewer: transfer speed in bytes/sec
-    numPeers,           // Viewer: number of P2P peers
-    isReceiving,        // Viewer: currently receiving file transfer
-    onFileReady,        // Host: callback with (file, blobUrl) when movie is ready
+    movieBlobUrl,
+    downloadProgress,
+    transferSpeed,
+    numPeers,
+    isReceiving,
+    onFileReady,
     onTimeUpdate,
     onSubtitlesLoaded,
     playbackSync,
     socket,
 }) {
     const [localMovieUrl, setLocalMovieUrl] = useState(null);
-
     const [isLoading, setIsLoading] = useState(false);
-
     const [loadProgress, setLoadProgress] = useState(0);
     const [error, setError] = useState('');
     const [isDragging, setIsDragging] = useState(false);
     const [playbackNotice, setPlaybackNotice] = useState('');
+
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
     const selectedFileRef = useRef(null);
+    const viewerPlayableAckSentRef = useRef(false);
+    const pendingHostStartRef = useRef(false);
 
-    // Handle file selection (host only)
     const handleFileSelect = useCallback(
         async (file) => {
             if (!file) return;
@@ -44,26 +44,20 @@ export default function VideoPlayer({
                 let processedFile = file;
 
                 if (isNativeMP4(file)) {
-                    // MP4 files: Use mp4box.js for INSTANT fragmentation
                     console.log('[player] MP4 detected — using mp4box.js (fast path)');
                     setLoadProgress(5);
 
-                    // First probe to check codecs
                     const probeResult = await probeMP4(file);
                     console.log('[player] Probe result:', probeResult);
 
                     if (probeResult.isHevc) {
                         const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-                        if (hevcSupported) {
-                            console.log('[player] HEVC supported by browser — passing through');
-                        } else {
-                            console.warn('[player] HEVC not supported by this browser. Playback may fail.');
+                        if (!hevcSupported) {
                             setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge.');
                         }
                     }
 
                     if (!probeResult.hasAac) {
-                        // Non-AAC audio in MP4 — need ffmpeg to transcode audio
                         console.log('[player] Non-AAC audio detected, using ffmpeg for audio transcoding');
                         setLoadProgress(10);
                         const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
@@ -73,7 +67,6 @@ export default function VideoPlayer({
                         const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                         processedFile = new File([blob], newName, { type: result.mime });
                     } else {
-                        // AAC audio — use mp4box.js (instant)
                         const result = await fragmentMP4(file, (p) => setLoadProgress(p));
                         url = result.url;
                         const response = await fetch(url);
@@ -82,18 +75,21 @@ export default function VideoPlayer({
                         processedFile = new File([blob], newName, { type: result.mime });
                     }
                 } else if (needsTransmux(file)) {
-                    // MKV and other formats: Use ffmpeg.wasm (remux only)
                     console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
                     setLoadProgress(5);
-                    const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
-                    url = result.url;
+
+                    let result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
 
                     if (result.isHevc) {
                         const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
                         if (!hevcSupported) {
-                            setError('This video uses HEVC/H.265 which your browser may not support.');
+                            console.log('[player] HEVC unsupported — transcoding video to H.264 for compatibility');
+                            setLoadProgress(0);
+                            result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
                         }
                     }
+
+                    url = result.url;
 
                     const response = await fetch(url);
                     const blob = await response.blob();
@@ -107,14 +103,12 @@ export default function VideoPlayer({
                 selectedFileRef.current = processedFile;
                 setIsLoading(false);
 
-                // Notify room about the movie
                 socket.current?.emit('movie-loaded', {
                     name: file.name,
                     duration: 0,
                 });
 
-                // Pass the file to parent for data channel transfer
-                onFileReady?.(processedFile, url);
+                onFileReady?.(processedFile, url, { preTranscode: false });
             } catch (err) {
                 setError(`Failed to load movie: ${err.message}`);
                 setIsLoading(false);
@@ -123,7 +117,6 @@ export default function VideoPlayer({
         [socket, onFileReady]
     );
 
-    // Handle subtitle file
     const handleSubtitleFile = useCallback(
         async (file) => {
             if (!file) return;
@@ -138,7 +131,6 @@ export default function VideoPlayer({
         [onSubtitlesLoaded]
     );
 
-    // Drag and drop
     const handleDragOver = (e) => {
         e.preventDefault();
         setIsDragging(true);
@@ -148,16 +140,15 @@ export default function VideoPlayer({
         e.preventDefault();
         setIsDragging(false);
         const file = e.dataTransfer.files[0];
-        if (file) {
-            if (file.name.match(/\.(srt|ass|ssa)$/i)) {
-                handleSubtitleFile(file);
-            } else {
-                handleFileSelect(file);
-            }
+        if (!file) return;
+
+        if (file.name.match(/\.(srt|ass|ssa)$/i)) {
+            handleSubtitleFile(file);
+        } else {
+            handleFileSelect(file);
         }
     };
 
-    // When video metadata loads
     const handleLoadedMetadata = useCallback(() => {
         const video = videoRef.current;
         if (!video) return;
@@ -168,14 +159,12 @@ export default function VideoPlayer({
         });
     }, [videoRef, localMovieUrl, movieBlobUrl, socket]);
 
-    // Set viewer's video source from blob URL
     useEffect(() => {
         if (!isHost && movieBlobUrl && videoRef.current) {
             videoRef.current.src = movieBlobUrl;
         }
     }, [isHost, movieBlobUrl, videoRef]);
 
-    // Time update handler
     useEffect(() => {
         const video = videoRef.current;
         if (!video) return;
@@ -188,20 +177,21 @@ export default function VideoPlayer({
         return () => video.removeEventListener('timeupdate', handleTime);
     }, [videoRef, onTimeUpdate]);
 
-    // Playback sync handlers
     const handlePlay = useCallback(() => {
         const video = videoRef.current;
         if (!video) return;
 
-        if (isHost && !peerBufferedReady) {
-            setPlaybackNotice('Waiting for your partner to buffer the movie...');
+        if (isHost && !peerPlayableReady) {
+            pendingHostStartRef.current = true;
+            setPlaybackNotice('Waiting for your partner player to become ready...');
             video.pause();
             return;
         }
 
         setPlaybackNotice('');
+        pendingHostStartRef.current = false;
         playbackSync?.emitPlay(video.currentTime);
-    }, [videoRef, playbackSync, isHost, peerBufferedReady]);
+    }, [videoRef, playbackSync, isHost, peerPlayableReady]);
 
     const handlePause = useCallback(() => {
         const video = videoRef.current;
@@ -214,12 +204,31 @@ export default function VideoPlayer({
     }, [videoRef, playbackSync]);
 
     useEffect(() => {
-        if (peerBufferedReady) {
-            setPlaybackNotice('');
-        }
-    }, [peerBufferedReady]);
+        if (!isHost || !peerPlayableReady) return;
 
-    // Host file picker area (when no movie loaded)
+        setPlaybackNotice('');
+
+        if (pendingHostStartRef.current && videoRef.current) {
+            videoRef.current.play().catch(() => { });
+            pendingHostStartRef.current = false;
+        }
+    }, [isHost, peerPlayableReady, videoRef]);
+
+    useEffect(() => {
+        if (!isHost) {
+            viewerPlayableAckSentRef.current = false;
+        }
+    }, [isHost, movieBlobUrl]);
+
+    const handleCanPlay = useCallback(() => {
+        console.log('[player] can play');
+
+        if (!isHost && !viewerPlayableAckSentRef.current) {
+            viewerPlayableAckSentRef.current = true;
+            socket.current?.emit('viewer-playable', { timestamp: Date.now() });
+        }
+    }, [isHost, socket]);
+
     if (isHost && !localMovieUrl && !isLoading) {
         return (
             <div
@@ -236,10 +245,7 @@ export default function VideoPlayer({
                     </svg>
                     <h3>Drop your movie here</h3>
                     <p>Supports MP4 and MKV files</p>
-                    <button
-                        className="player__browse-btn"
-                        onClick={() => fileInputRef.current?.click()}
-                    >
+                    <button className="player__browse-btn" onClick={() => fileInputRef.current?.click()}>
                         Browse Files
                     </button>
                     <input
@@ -255,7 +261,6 @@ export default function VideoPlayer({
         );
     }
 
-    // Loading state (MKV remuxing)
     if (isLoading) {
         return (
             <div className="player__loading">
@@ -272,37 +277,13 @@ export default function VideoPlayer({
         );
     }
 
-    // Viewer: downloading file from host (only show waiting screen if NO streaming source is ready)
-    // If isReceiving is true, we render the video player so renderTo can stream to it.
     if (!isHost && !movieBlobUrl && !isReceiving) {
         return (
             <div className="player__waiting">
                 <div className="player__waiting-content">
-                    {isReceiving ? (
-                        <>
-                            <div className="player__spinner-large" />
-                            <h3>Downloading movie...</h3>
-                            <p>Receiving file from host at full quality</p>
-                            <div className="player__progress-bar">
-                                <div className="player__progress-fill" style={{ width: `${downloadProgress}%` }} />
-                            </div>
-                            <span className="player__progress-text">
-                                {downloadProgress}%
-                                {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
-                            </span>
-                            {numPeers > 0 && (
-                                <p className="player__peers">
-                                    Connected to {numPeers} peer{numPeers !== 1 ? 's' : ''}
-                                </p>
-                            )}
-                        </>
-                    ) : (
-                        <>
-                            <div className="player__pulse" />
-                            <h3>Waiting for host...</h3>
-                            <p>The host will select a movie to stream</p>
-                        </>
-                    )}
+                    <div className="player__pulse" />
+                    <h3>Waiting for host...</h3>
+                    <p>The host will select a movie to stream</p>
                 </div>
             </div>
         );
@@ -324,10 +305,10 @@ export default function VideoPlayer({
                 onSeeked={handleSeek}
                 onError={(e) => console.error('[player] video error:', videoRef.current?.error, e)}
                 onLoadStart={() => console.log('[player] load start, currentSrc:', videoRef.current?.currentSrc || null)}
-                onCanPlay={() => console.log('[player] can play')}
+                onCanPlay={handleCanPlay}
                 playsInline
                 autoPlay={!isHost && hasDirectVideoSrc}
-                muted={!isHost} // Muted autoplay to ensure frame rendering
+                muted={!isHost}
             />
 
             <Controls
@@ -345,6 +326,14 @@ export default function VideoPlayer({
                     onChange={(e) => handleSubtitleFile(e.target.files[0])}
                     style={{ display: 'none' }}
                 />
+            )}
+
+            {(!isHost && isReceiving && !movieBlobUrl) && (
+                <div className="player__error">
+                    Downloading... {downloadProgress}%
+                    {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
+                    {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}
+                </div>
             )}
 
             {error && <div className="player__error">{error}</div>}

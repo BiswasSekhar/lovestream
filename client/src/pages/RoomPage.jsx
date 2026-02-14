@@ -34,7 +34,7 @@ function RoomContent() {
     // Subtitles
     const [subtitleCues, setSubtitleCues] = useState([]);
     const [currentTime, setCurrentTime] = useState(0);
-    const [viewerBufferedReady, setViewerBufferedReady] = useState(false);
+    const [viewerPlayableReady, setViewerPlayableReady] = useState(false);
 
     // WebRTC (video call only — no movie stream)
     const {
@@ -176,14 +176,14 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock) return;
 
-        const handleViewerBufferReady = ({ progress }) => {
+        const handleViewerPlayable = ({ timestamp }) => {
             if (!isHost) return;
-            setViewerBufferedReady(true);
-            console.log('[room] viewer is buffered and ready:', progress + '%');
+            setViewerPlayableReady(true);
+            console.log('[room] viewer can play now (ack):', timestamp);
         };
 
-        sock.on('viewer-buffer-ready', handleViewerBufferReady);
-        return () => sock.off('viewer-buffer-ready', handleViewerBufferReady);
+        sock.on('viewer-playable', handleViewerPlayable);
+        return () => sock.off('viewer-playable', handleViewerPlayable);
     }, [socket, isHost]);
 
     // Track current time for subtitles
@@ -197,17 +197,22 @@ function RoomContent() {
 
     // Handle movie file ready from VideoPlayer (host)
     const handleFileReady = useCallback(
-        (file) => {
-            // Track current file for reconnection sync
-            currentFileRef.current = file;
+        (file, _url, options = {}) => {
+            const isPreTranscodeSeed = Boolean(options.preTranscode);
 
-            // New movie selected: require fresh viewer buffer confirmation
+            // New movie selected: require fresh viewer buffer confirmation.
+            // Reset on first (pre) seed phase so host cannot start too early.
             if (isHost) {
-                setViewerBufferedReady(false);
+                setViewerPlayableReady(false);
             }
 
-            // Seed the file via WebTorrent (P2P)
-            seedFile(file);
+            // Keep reconnection source as finalized file only.
+            if (!isPreTranscodeSeed) {
+                currentFileRef.current = file;
+            }
+
+            // Seed current phase via WebTorrent.
+            seedFile(file, { preTranscode: isPreTranscodeSeed });
         },
         [seedFile, isHost]
     );
@@ -284,7 +289,13 @@ function RoomContent() {
                             </svg>
                         </span>
                         <span className={`room__status room__status--${connectionState}`}>
-                            {connectionState === 'connected' ? '● Partner connected' : connectionState === 'connecting' ? '◌ Connecting...' : '○ Waiting for partner'}
+                            {connectionState === 'connected'
+                                ? (isHost
+                                    ? (viewerPlayableReady ? '● Partner ready to play' : '◌ Partner buffering...')
+                                    : '● Partner connected')
+                                : connectionState === 'connecting'
+                                    ? '◌ Connecting...'
+                                    : '○ Waiting for partner'}
                         </span>
                     </div>
                 </div>
@@ -312,7 +323,7 @@ function RoomContent() {
                 <div className="room__player-area">
                     <VideoPlayer
                         isHost={isHost}
-                        peerBufferedReady={!isHost || viewerBufferedReady}
+                        peerPlayableReady={!isHost || viewerPlayableReady}
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
                         movieBlobUrl={movieBlobUrl}
                         downloadProgress={downloadProgress}

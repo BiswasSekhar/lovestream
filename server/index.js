@@ -5,6 +5,10 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import { Server as TrackerServer } from 'bittorrent-tracker';
+import multer from 'multer';
+import ffmpegPath from 'ffmpeg-static';
+import { spawn } from 'child_process';
+import { createReadStream, promises as fs } from 'fs';
 import RoomManager from './roomManager.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -17,10 +21,21 @@ const httpServer = createServer(app);
 
 const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 const PORT = process.env.PORT || 3001;
+const upload = multer({
+    dest: join(__dirname, '.tmp-transcode'),
+    limits: {
+        fileSize: 1024 * 1024 * 1024, // 1GB
+    },
+});
 
 // CORS — allow any origin for tunnel/remote access
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+app.use((_req, res, next) => {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    next();
+});
 
 // Socket.IO
 const io = new Server(httpServer, {
@@ -60,6 +75,70 @@ app.get('/ice-servers', (_req, res) => {
     }
 
     res.json(servers);
+});
+
+app.post('/transcode', upload.single('video'), async (req, res) => {
+    const uploaded = req.file;
+    if (!uploaded) {
+        res.status(400).json({ error: 'No video file uploaded' });
+        return;
+    }
+
+    if (!ffmpegPath) {
+        await fs.unlink(uploaded.path).catch(() => { });
+        res.status(500).json({ error: 'FFmpeg binary is not available on server' });
+        return;
+    }
+
+    const inputPath = uploaded.path;
+    const outputPath = `${uploaded.path}.streamable.mp4`;
+    const outputName = `${(uploaded.originalname || 'video').replace(/\.[^/.]+$/, '')}.streamable.mp4`;
+
+    const args = [
+        '-y',
+        '-i', inputPath,
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '24',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '128k',
+        '-movflags', '+faststart',
+        outputPath,
+    ];
+
+    let stderr = '';
+
+    const ffmpeg = spawn(ffmpegPath, args, { windowsHide: true });
+    ffmpeg.stderr.on('data', (chunk) => {
+        stderr += chunk.toString();
+    });
+
+    ffmpeg.on('error', async (err) => {
+        await fs.unlink(inputPath).catch(() => { });
+        await fs.unlink(outputPath).catch(() => { });
+        res.status(500).json({ error: `Failed to start ffmpeg: ${err.message}` });
+    });
+
+    ffmpeg.on('close', async (code) => {
+        if (code !== 0) {
+            await fs.unlink(inputPath).catch(() => { });
+            await fs.unlink(outputPath).catch(() => { });
+            res.status(500).json({ error: `Transcode failed (${code}): ${stderr.slice(-1200)}` });
+            return;
+        }
+
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${outputName}"`);
+
+        const stream = createReadStream(outputPath);
+        stream.pipe(res);
+
+        stream.on('close', async () => {
+            await fs.unlink(inputPath).catch(() => { });
+            await fs.unlink(outputPath).catch(() => { });
+        });
+    });
 });
 
 // Serve static files from the React client build
