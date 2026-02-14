@@ -403,6 +403,8 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                                 if (err) {
                                     console.warn('[webtorrent] renderMedia error (non-fatal):', err.message);
                                     renderMediaReadyRef.current = false;
+                                    // Clear broken MSE URL so UI falls back to download progress
+                                    setMovieBlobUrl(null);
                                 } else {
                                     renderMediaReadyRef.current = true;
                                     console.log('[webtorrent] streaming to video element via render-media');

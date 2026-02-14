@@ -523,6 +523,7 @@ function RoomContent() {
                         roomCode={roomCode}
                         isHost={isHost}
                         roomMode={roomMode}
+                        movieName={state.movieName}
                         peerPlayableReady={!isHost || viewerPlayableReady}
                         allowHostSoloPlayback={allowSoloPlayback}
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
@@ -532,6 +533,7 @@ function RoomContent() {
                         numPeers={numPeers}
                         isSending={isSending}
                         isReceiving={isReceiving}
+                        resetTransferState={resetTransferState}
                         onFileReady={handleFileReady}
                         onTimeUpdate={handleTimeUpdate}
                         onSubtitlesLoaded={handleSubtitlesLoaded}

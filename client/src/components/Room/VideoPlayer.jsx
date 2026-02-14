@@ -9,6 +9,7 @@ import Controls from './Controls.jsx';
 export default function VideoPlayer({
     roomCode,
     isHost,
+    movieName,
     peerPlayableReady = true,
     allowHostSoloPlayback = false,
     videoRef,
@@ -18,6 +19,7 @@ export default function VideoPlayer({
     numPeers,
     isSending,
     isReceiving,
+    resetTransferState,
     onFileReady,
     onTimeUpdate,
     onSubtitlesLoaded,
@@ -39,6 +41,7 @@ export default function VideoPlayer({
 
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
+    const viewerFileInputRef = useRef(null);
     const selectedFileRef = useRef(null);
     const pendingHostStartRef = useRef(false);
     const checkedCachePromptRef = useRef(false);
@@ -140,6 +143,19 @@ export default function VideoPlayer({
         setShowSaveOffer(null);
         clearCompletedDownload?.();
     }, [clearCompletedDownload]);
+
+    // Viewer: load their own copy of the movie for synced playback
+    const handleViewerLoadLocal = useCallback((file) => {
+        if (!file || isHost) return;
+        setError('');
+        const url = URL.createObjectURL(file);
+        setLocalMovieUrl(url);
+        resetTransferState?.();
+        socket.current?.emit('viewer-stream-ready', {
+            progress: 100,
+            timestamp: Date.now(),
+        });
+    }, [isHost, resetTransferState, socket]);
 
     // Load movie from library
     const handleLoadFromLibrary = useCallback(async (movie) => {
@@ -626,19 +642,35 @@ export default function VideoPlayer({
         );
     }
 
-    if (!isHost && !movieBlobUrl && !isReceiving) {
+    if (!isHost && !movieBlobUrl && !localMovieUrl && !isReceiving) {
         return (
             <div className="player__waiting">
                 <div className="player__waiting-content">
                     <div className="player__pulse" />
                     <h3>Waiting for host...</h3>
                     <p>The host will select a movie to stream</p>
+                    {movieName && (
+                        <div className="player__local-option">
+                            <p className="player__local-label">Now playing: <strong>{movieName}</strong></p>
+                            <p style={{ fontSize: '0.85rem', opacity: 0.6, margin: '4px 0 8px' }}>Have this movie? Load your copy for instant synced playback</p>
+                            <button className="player__browse-btn" onClick={() => viewerFileInputRef.current?.click()}>
+                                Load My Copy
+                            </button>
+                            <input
+                                ref={viewerFileInputRef}
+                                type="file"
+                                accept=".mp4,.mkv,.webm,.mov"
+                                onChange={(e) => { handleViewerLoadLocal(e.target.files[0]); e.target.value = ''; }}
+                                style={{ display: 'none' }}
+                            />
+                        </div>
+                    )}
                 </div>
             </div>
         );
     }
 
-    const videoSrc = isHost ? localMovieUrl : movieBlobUrl;
+    const videoSrc = isHost ? localMovieUrl : (localMovieUrl || movieBlobUrl);
     const hasDirectVideoSrc = Boolean(videoSrc);
     const videoSourceProps = hasDirectVideoSrc ? { src: videoSrc } : {};
 
@@ -677,11 +709,23 @@ export default function VideoPlayer({
                 />
             )}
 
-            {(!isHost && isReceiving && !movieBlobUrl) && (
-                <div className="player__error">
-                    Downloading... {downloadProgress}%
-                    {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
-                    {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}
+            {(!isHost && isReceiving && !movieBlobUrl && !localMovieUrl) && (
+                <div className="player__download-bar">
+                    <span>
+                        Downloading... {downloadProgress}%
+                        {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
+                        {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}
+                    </span>
+                    <button className="player__browse-btn player__local-btn" onClick={() => viewerFileInputRef.current?.click()}>
+                        Load My Copy
+                    </button>
+                    <input
+                        ref={viewerFileInputRef}
+                        type="file"
+                        accept=".mp4,.mkv,.webm,.mov"
+                        onChange={(e) => { handleViewerLoadLocal(e.target.files[0]); e.target.value = ''; }}
+                        style={{ display: 'none' }}
+                    />
                 </div>
             )}
 

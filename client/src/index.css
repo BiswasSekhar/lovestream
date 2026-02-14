@@ -760,6 +760,47 @@ a {
   color: var(--text-secondary);
 }
 
+/* Viewer "load your own copy" option */
+.player__local-option {
+  margin-top: var(--space-md);
+  padding-top: var(--space-md);
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  width: 100%;
+  max-width: 340px;
+}
+
+.player__local-label {
+  font-size: 0.9rem;
+  margin: 0;
+  word-break: break-word;
+}
+
+/* Download bar with "load my copy" button */
+.player__download-bar {
+  position: absolute;
+  bottom: 80px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background: rgba(15, 15, 30, 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  z-index: 5;
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
+}
+
+.player__local-btn {
+  padding: 3px 10px !important;
+  font-size: 0.75rem !important;
+  white-space: nowrap;
+}
+
 .player__pulse {
   width: 60px;
   height: 60px;
