@@ -34,6 +34,15 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
     const hasSentStreamReadyRef = useRef(false);
     const activeMagnetRef = useRef(null);
     const lastPersistedPositionRef = useRef(0);
+    const seededFileKeyRef = useRef('');
+
+    const buildFileKey = useCallback((file) => {
+        if (!file) return '';
+        const name = file.name || '';
+        const size = Number(file.size || 0);
+        const modified = Number(file.lastModified || 0);
+        return `${name}::${size}::${modified}`;
+    }, []);
 
     // Get tracker URL from server URL
     const trackerUrl = SERVER_URL.replace(/^http/, 'ws') + '/';
@@ -145,6 +154,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         renderMediaReadyRef.current = false;
         hasSentStreamReadyRef.current = false;
         lastPersistedPositionRef.current = 0;
+        seededFileKeyRef.current = '';
     }, [stopProgressUpdates]);
 
     useEffect(() => {
@@ -160,6 +170,11 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                 setDownloadProgress(100);
                 setIsReceiving(false);
                 hasSentStreamReadyRef.current = true;
+
+                socket?.current?.emit('viewer-stream-ready', {
+                    progress: 100,
+                    timestamp: Date.now(),
+                });
 
                 const resumeAt = Number(cached.lastPosition || 0);
                 const video = videoRef?.current;
@@ -178,7 +193,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         return () => {
             cancelled = true;
         };
-    }, [isHost, roomCode]);
+    }, [isHost, roomCode, socket, videoRef]);
 
     useEffect(() => {
         if (isHost || !roomCode) return;
@@ -206,10 +221,30 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         }
 
         const isPreTranscodeSeed = Boolean(options.preTranscode);
+        const fileKey = buildFileKey(file);
+
+        if (!isPreTranscodeSeed && torrentRef.current && seededFileKeyRef.current === fileKey) {
+            const existingMagnet = torrentRef.current.magnetURI;
+            if (existingMagnet) {
+                console.log('[webtorrent] same file already seeded, re-sharing existing magnet');
+                sock.emit('torrent-magnet', {
+                    magnetURI: existingMagnet,
+                    preTranscode: false,
+                    name: file.name,
+                });
+                startProgressUpdates(torrentRef.current);
+                setIsSending(false);
+                return;
+            }
+        }
 
         // Remove any existing torrent
         if (torrentRef.current) {
-            client.remove(torrentRef.current);
+            try {
+                client.remove(torrentRef.current);
+            } catch (err) {
+                console.warn('[webtorrent] failed to remove existing torrent before reseed:', err?.message || err);
+            }
             torrentRef.current = null;
         }
 
@@ -221,6 +256,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
             announce: [trackerUrl],
         }, (torrent) => {
             torrentRef.current = torrent;
+            seededFileKeyRef.current = fileKey;
             console.log('[webtorrent] seeding! magnetURI:', torrent.magnetURI);
 
             // Share magnet URI with viewers via socket.io
@@ -239,7 +275,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                 setNumPeers(torrent.numPeers);
             });
         });
-    }, [socket, trackerUrl, startProgressUpdates]);
+    }, [socket, trackerUrl, startProgressUpdates, buildFileKey]);
 
     // Viewer: listen for magnet URI and start downloading
     useEffect(() => {
