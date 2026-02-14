@@ -2,9 +2,47 @@ const { app, BrowserWindow, ipcMain } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { spawn } = require('child_process');
 
 let vlcInstance = null;
 let createVlcFactory = null;
+
+/* ── Locate bundled VLC binary from vlc-static ── */
+function findVlcBinary() {
+    const possibleBases = [];
+
+    if (app.isPackaged) {
+        possibleBases.push(
+            path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'vlc-static')
+        );
+    }
+    possibleBases.push(
+        path.join(__dirname, '..', 'node_modules', 'vlc-static')
+    );
+
+    const platform = process.platform === 'win32' ? 'windows'
+        : process.platform === 'darwin' ? 'mac' : 'linux';
+    const arch = process.arch === 'x64' ? 'x64' : 'ia32';
+    const exeName = process.platform === 'win32' ? 'vlc.exe' : 'vlc';
+
+    for (const base of possibleBases) {
+        try {
+            const binDir = path.join(base, 'bin', platform, arch);
+            if (!fs.existsSync(binDir)) continue;
+
+            const entries = fs.readdirSync(binDir);
+            const vlcDir = entries.find((e) => e.startsWith('vlc-'));
+            if (!vlcDir) continue;
+
+            const vlcPath = path.join(binDir, vlcDir, exeName);
+            if (fs.existsSync(vlcPath)) {
+                console.log('[vlc] Found binary:', vlcPath);
+                return vlcPath;
+            }
+        } catch { }
+    }
+    return null;
+}
 
 async function ensureVlc() {
     if (vlcInstance) return vlcInstance;
@@ -100,6 +138,116 @@ function registerVlcIpc() {
             return { success: true, info };
         } catch (error) {
             return { success: false, error: error?.message || String(error) };
+        }
+    });
+
+    /* ── VLC smart process: remux (fast) or full transcode ── */
+    ipcMain.handle('native-vlc:process-file', async (_event, { inputPath, forceVideoTranscode = false }) => {
+        const vlcBin = findVlcBinary();
+        if (!vlcBin) return { success: false, error: 'VLC binary not found' };
+        if (!inputPath || !fs.existsSync(inputPath))
+            return { success: false, error: 'Input file not found: ' + inputPath };
+
+        const tempDir = path.join(os.tmpdir(), 'lovestream-vlc');
+        fs.mkdirSync(tempDir, { recursive: true });
+        const outputPath = path.join(tempDir, `${Date.now()}.mp4`);
+        const outputPathForVlc = outputPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+
+        const mode = forceVideoTranscode ? 'full transcode (H.264+AAC)' : 'fast remux (copy video, AAC audio)';
+        console.log(`[vlc] ${mode}`);
+        console.log('[vlc] Input :', inputPath);
+        console.log('[vlc] Output:', outputPath);
+
+        return new Promise((resolve) => {
+            let sout;
+            if (forceVideoTranscode) {
+                // Full transcode: re-encode video to H.264, audio to AAC
+                sout = [
+                    '#transcode{vcodec=h264,venc=x264{preset=ultrafast},',
+                    'acodec=aac,ab=192,channels=2,samplerate=48000}',
+                    `:standard{access=file,mux=mp4,dst=${outputPathForVlc}}`
+                ].join('');
+            } else {
+                // Fast remux: copy video streams as-is, only transcode audio to AAC
+                sout = [
+                    '#transcode{vcodec=copy,acodec=aac,ab=192,channels=2,samplerate=48000,scodec=none}',
+                    `:standard{access=file,mux=mp4,dst=${outputPathForVlc}}`
+                ].join('');
+            }
+
+            const args = [
+                '-I', 'dummy',
+                '--quiet',
+                '--no-video-title-show',
+                '--no-repeat',
+                '--no-loop',
+                inputPath,
+                '--sout', sout,
+                'vlc://quit'
+            ];
+
+            console.log('[vlc] Spawning VLC…');
+            const child = spawn(vlcBin, args, { stdio: 'pipe', windowsHide: true });
+            const timeoutMs = forceVideoTranscode ? 10 * 60 * 1000 : 3 * 60 * 1000;
+            let settled = false;
+            const finalize = (payload) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(payload);
+            };
+
+            let stderr = '';
+            let stdout = '';
+            child.stdout?.on('data', (d) => { stdout += d.toString(); });
+            child.stderr?.on('data', (d) => { stderr += d.toString(); });
+
+            const timer = setTimeout(() => {
+                try { child.kill('SIGKILL'); } catch { }
+                console.error('[vlc] Timeout waiting for process-file to complete');
+                finalize({ success: false, error: `VLC timed out after ${Math.round(timeoutMs / 1000)}s` });
+            }, timeoutMs);
+
+            child.on('close', (code) => {
+                if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+                    console.log('[vlc] Done —', fs.statSync(outputPath).size, 'bytes');
+                    finalize({ success: true, outputPath });
+                } else {
+                    console.error('[vlc] Failed. code:', code, stderr.slice(-500) || stdout.slice(-500));
+                    finalize({ success: false, error: `VLC exited ${code}: ${(stderr || stdout).slice(-300)}` });
+                }
+            });
+
+            child.on('error', (err) => {
+                console.error('[vlc] Spawn error:', err);
+                finalize({ success: false, error: err.message });
+            });
+        });
+    });
+
+    /* ── Read a local file and return its bytes (for transcoded output) ── */
+    ipcMain.handle('native-vlc:read-file', async (_event, { filePath }) => {
+        try {
+            if (!filePath || !fs.existsSync(filePath))
+                return { success: false, error: 'File not found' };
+            const data = fs.readFileSync(filePath);
+            return { success: true, data: data.buffer };
+        } catch (err) {
+            return { success: false, error: err.message };
+        }
+    });
+
+    /* ── Save bytes to a temp file (for blobs without file.path) ── */
+    ipcMain.handle('native-vlc:save-temp-file', async (_event, { bytes, fileName }) => {
+        try {
+            const tempDir = path.join(os.tmpdir(), 'lovestream-vlc');
+            fs.mkdirSync(tempDir, { recursive: true });
+            const safeName = String(fileName || 'input').replace(/[^a-zA-Z0-9._-]/g, '_');
+            const tempPath = path.join(tempDir, `${Date.now()}-${safeName}`);
+            fs.writeFileSync(tempPath, Buffer.from(bytes));
+            return { success: true, filePath: tempPath };
+        } catch (err) {
+            return { success: false, error: err.message };
         }
     });
 }

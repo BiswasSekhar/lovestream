@@ -104,36 +104,159 @@ export default function VideoPlayer({
             try {
                 let url;
                 let processedFile = file;
-                const useNativePipeline = roomMode === 'native' && Boolean(window?.electron?.nativeVlc);
+                const hasVlcProcess = Boolean(window?.electron?.nativeVlc?.processFile);
 
-                if (useNativePipeline) {
-                    console.log('[player] native mode active — skipping browser transmux/transcode');
-                    url = URL.createObjectURL(file);
-                    processedFile = file;
-                } else if (isNativeMP4(file)) {
-                    console.log('[player] MP4 detected — using mp4box.js (fast path)');
-                    setLoadProgress(5);
+                /* ───── helper: resolve input path for VLC ───── */
+                const resolveInputPath = async (inputFile) => {
+                    let inputPath = inputFile.path || null;
+                    if (!inputPath) {
+                        console.log('[vlc] No file.path — saving to temp…');
+                        const buf = await inputFile.arrayBuffer();
+                        const saved = await window.electron.nativeVlc.saveTempFile(
+                            new Uint8Array(buf),
+                            inputFile.name,
+                        );
+                        if (!saved?.success) throw new Error(saved?.error || 'Failed to save temp file');
+                        inputPath = saved.filePath;
+                    }
+                    return inputPath;
+                };
 
-                    const probeResult = await probeMP4(file);
-                    console.log('[player] Probe result:', probeResult);
+                /* ───── helper: read VLC output into a File ───── */
+                const readVlcOutput = async (outputPath, originalName) => {
+                    const fileData = await window.electron.nativeVlc.readFile(outputPath);
+                    if (!fileData?.success || !fileData.data) {
+                        throw new Error('Failed to read VLC output');
+                    }
+                    const blob = new Blob([new Uint8Array(fileData.data)], { type: 'video/mp4' });
+                    const newName = originalName.replace(/\.[^/.]+$/, '') + '.mp4';
+                    const outFile = new File([blob], newName, { type: 'video/mp4' });
+                    return { url: URL.createObjectURL(blob), file: outFile };
+                };
 
-                    if (probeResult.isHevc) {
-                        const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-                        if (!hevcSupported) {
-                            setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge.');
-                        }
+                /* ───── helper: VLC smart process (Electron only) ───── */
+                const vlcSmartProcess = async (inputFile) => {
+                    const inputPath = await resolveInputPath(inputFile);
+
+                    // Step 1: Fast remux — copy video, transcode audio to AAC (~5 seconds)
+                    console.log('[vlc] Step 1: Fast remux (copy video, AAC audio):', inputPath);
+                    setLoadProgress(10);
+                    setPlaybackNotice('Remuxing to MP4 (fast)…');
+
+                    let result = await window.electron.nativeVlc.processFile(inputPath, false);
+                    if (!result?.success || !result.outputPath) {
+                        throw new Error(result?.error || 'VLC remux failed');
                     }
 
-                    if (!probeResult.hasAac) {
-                        console.log('[player] Non-AAC audio detected, using ffmpeg for audio transcoding');
+                    setLoadProgress(60);
+                    let out = await readVlcOutput(result.outputPath, inputFile.name);
+
+                    // Step 2: Probe the remuxed output — check if HEVC
+                    const probeResult = await probeMP4(out.file);
+                    const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+
+                    if (probeResult.isHevc && !hevcSupported) {
+                        // HEVC detected and browser can't play it → full transcode
+                        console.log('[vlc] Step 2: HEVC detected — full transcode to H.264…');
                         setLoadProgress(10);
-                        const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
+                        setPlaybackNotice('Transcoding HEVC → H.264 (VLC native)…');
+
+                        URL.revokeObjectURL(out.url);
+                        result = await window.electron.nativeVlc.processFile(inputPath, true);
+                        if (!result?.success || !result.outputPath) {
+                            throw new Error(result?.error || 'VLC transcode failed');
+                        }
+
+                        setLoadProgress(80);
+                        out = await readVlcOutput(result.outputPath, inputFile.name);
+                    } else {
+                        console.log('[vlc] Remux done — video is H.264 compatible, no transcode needed');
+                    }
+
+                    setPlaybackNotice('');
+                    setLoadProgress(100);
+                    return out;
+                };
+
+                /* ─── 1. MKV / non-MP4 containers ─── */
+                if (needsTransmux(file)) {
+                    if (hasVlcProcess) {
+                        /* Electron: VLC smart process — remux first, transcode only if HEVC */
+                        console.log('[player] MKV detected — using VLC smart process');
+                        const out = await vlcSmartProcess(file);
+                        url = out.url;
+                        processedFile = out.file;
+                    } else {
+                        /* Browser fallback: ffmpeg.wasm */
+                        console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
+                        setLoadProgress(5);
+
+                        let result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
+
+                        if (result.isHevc) {
+                            const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                            if (!hevcSupported) {
+                                console.log('[player] HEVC unsupported — transcoding video to H.264 for compatibility');
+                                setLoadProgress(0);
+                                result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
+                            }
+                        }
+
                         url = result.url;
                         const response = await fetch(url);
                         const blob = await response.blob();
                         const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                         processedFile = new File([blob], newName, { type: result.mime });
+                    }
+
+                /* ─── 2. MP4 containers ─── */
+                } else if (isNativeMP4(file)) {
+                    console.log('[player] MP4 detected — probing codecs…');
+                    setLoadProgress(5);
+
+                    const probeResult = await probeMP4(file);
+                    console.log('[player] Probe result:', probeResult);
+
+                    const needsVideoTranscode = probeResult.isHevc &&
+                        !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                    const needsAudioTranscode = !probeResult.hasAac;
+
+                    if (needsVideoTranscode || needsAudioTranscode) {
+                        if (hasVlcProcess) {
+                            /* Electron: VLC smart process — remux or transcode as needed */
+                            const forceVideo = needsVideoTranscode;
+                            const label = forceVideo ? 'HEVC → H.264' : 'audio → AAC';
+                            console.log(`[player] MP4 needs ${label} — using VLC native`);
+                            setPlaybackNotice(`Processing ${label} (VLC native)…`);
+
+                            const inputPath = await resolveInputPath(file);
+                            const result = await window.electron.nativeVlc.processFile(inputPath, forceVideo);
+                            if (!result?.success || !result.outputPath) {
+                                throw new Error(result?.error || 'VLC process failed');
+                            }
+
+                            setLoadProgress(80);
+                            const out = await readVlcOutput(result.outputPath, file.name);
+                            setPlaybackNotice('');
+                            setLoadProgress(100);
+                            url = out.url;
+                            processedFile = out.file;
+                        } else {
+                            /* Browser fallback */
+                            if (needsVideoTranscode) {
+                                setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge.');
+                            }
+                            console.log('[player] MP4 needs transcode — using ffmpeg.wasm');
+                            setLoadProgress(10);
+                            const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
+                            url = result.url;
+                            const response = await fetch(url);
+                            const blob = await response.blob();
+                            const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                            processedFile = new File([blob], newName, { type: result.mime });
+                        }
                     } else {
+                        /* Clean MP4 with H.264 + AAC: fast mp4box fragmentation (no transcode) */
                         const result = await fragmentMP4(file, (p) => setLoadProgress(p));
                         url = result.url;
                         const response = await fetch(url);
@@ -141,27 +264,8 @@ export default function VideoPlayer({
                         const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                         processedFile = new File([blob], newName, { type: result.mime });
                     }
-                } else if (needsTransmux(file)) {
-                    console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
-                    setLoadProgress(5);
 
-                    let result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
-
-                    if (result.isHevc) {
-                        const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-                        if (!hevcSupported) {
-                            console.log('[player] HEVC unsupported — transcoding video to H.264 for compatibility');
-                            setLoadProgress(0);
-                            result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
-                        }
-                    }
-
-                    url = result.url;
-
-                    const response = await fetch(url);
-                    const blob = await response.blob();
-                    const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
-                    processedFile = new File([blob], newName, { type: result.mime });
+                /* ─── 3. Other (e.g. WebM) — play directly ─── */
                 } else {
                     url = URL.createObjectURL(file);
                 }

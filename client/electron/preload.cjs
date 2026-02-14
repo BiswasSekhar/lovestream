@@ -12,5 +12,9 @@ contextBridge.exposeInMainWorld('electron', {
         }),
         command: (name, options = undefined) => ipcRenderer.invoke('native-vlc:command', { name, options }),
         info: () => ipcRenderer.invoke('native-vlc:info'),
+        processFile: (inputPath, forceVideoTranscode = false) =>
+            ipcRenderer.invoke('native-vlc:process-file', { inputPath, forceVideoTranscode }),
+        readFile: (filePath) => ipcRenderer.invoke('native-vlc:read-file', { filePath }),
+        saveTempFile: (bytes, fileName) => ipcRenderer.invoke('native-vlc:save-temp-file', { bytes, fileName }),
     },
 });
