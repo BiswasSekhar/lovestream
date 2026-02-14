@@ -86,6 +86,30 @@ class RoomManager {
             this.socketToRoom.set(socketId, code);
             return { room, role: 'viewer' };
         }
+        // Room appears full — but the reconnecting peer may have the same participantId
+        // as a stale socket whose disconnect event hasn't fired yet. Force-evict the stale one.
+        if (participant) {
+            if (room.hostParticipantId === participant && room.host !== socketId) {
+                console.log(`[room] force-evicting stale host socket ${room.host} for participant ${participant}`);
+                this.socketToRoom.delete(room.host);
+                room.host = socketId;
+                room.hostDisconnectedAt = null;
+                room.hostCapabilities = caps;
+                this.#recomputeRoomMode(room);
+                this.socketToRoom.set(socketId, code);
+                return { room, role: 'host', reclaimed: true };
+            }
+            if (room.viewerParticipantId === participant && room.viewer !== socketId) {
+                console.log(`[room] force-evicting stale viewer socket ${room.viewer} for participant ${participant}`);
+                this.socketToRoom.delete(room.viewer);
+                room.viewer = socketId;
+                room.viewerDisconnectedAt = null;
+                room.viewerCapabilities = caps;
+                this.#recomputeRoomMode(room);
+                this.socketToRoom.set(socketId, code);
+                return { room, role: 'viewer', reclaimed: true };
+            }
+        }
 
         return { error: 'Room is full. Only 1-on-1 sessions are supported.' };
     }

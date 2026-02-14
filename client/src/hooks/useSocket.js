@@ -55,8 +55,8 @@ function getSocket() {
     if (!sharedSocket) {
         sharedSocket = io(SERVER_URL, {
             path: '/socket.io',
-            transports: ['polling', 'websocket'],
-            upgrade: true,
+            transports: ['websocket'],
+            upgrade: false,
             reconnection: true,
             reconnectionAttempts: Infinity,
             reconnectionDelay: 1000,
