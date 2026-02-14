@@ -465,7 +465,11 @@ export default function VideoPlayer({
 
     useEffect(() => {
         if (!isHost && movieBlobUrl && videoRef.current) {
-            videoRef.current.src = movieBlobUrl;
+            // Only set src if it differs — render-media may already have set the
+            // same MSE URL, and overwriting would restart playback.
+            if (videoRef.current.src !== movieBlobUrl) {
+                videoRef.current.src = movieBlobUrl;
+            }
         }
     }, [isHost, movieBlobUrl, videoRef]);
 

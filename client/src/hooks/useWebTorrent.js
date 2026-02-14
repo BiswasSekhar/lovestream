@@ -328,10 +328,26 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                 }
             }
 
-            // Remove any existing torrent
+            // Remove any existing torrent (wait for destruction to avoid duplicate-add race)
             if (torrentRef.current) {
-                client.remove(torrentRef.current);
+                try {
+                    await new Promise((resolve) => {
+                        client.remove(torrentRef.current, {}, resolve);
+                    });
+                } catch { }
                 torrentRef.current = null;
+            }
+
+            // If the client already has this torrent (e.g. reconnection with same file), reuse it
+            const existingTorrent = client.torrents.find(
+                (t) => t.magnetURI === magnetURI || t.infoHash === magnetURI.match(/btih:([a-fA-F0-9]+)/)?.[1]
+            );
+            if (existingTorrent) {
+                try {
+                    await new Promise((resolve) => {
+                        client.remove(existingTorrent, {}, resolve);
+                    });
+                } catch { }
             }
 
             currentTorrentTokenRef.current += 1;
@@ -371,27 +387,31 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                     if (isPreTranscode) {
                         console.log('[webtorrent] pre-transcode prefetch phase active; skipping player attach');
                     } else if (videoRef?.current) {
+                        // Progressive streaming via render-media (uses MSE internally).
+                        // The duplicate-torrent race is handled above, so pipe conflicts
+                        // should no longer occur.
                         try {
                             renderMedia.render(videoFile, videoRef.current, {
                                 autoplay: false,
                                 controls: false,
-                            }, (err, elem) => {
+                            }, (err) => {
                                 if (token !== currentTorrentTokenRef.current) return;
-
                                 if (err) {
-                                    console.error('[webtorrent] renderMedia error:', err.message);
+                                    console.warn('[webtorrent] renderMedia error (non-fatal):', err.message);
                                     renderMediaReadyRef.current = false;
-                                    // Don't create blob fallback here — file is still downloading.
-                                    // Blob will be created when download completes (torrent 'done' event).
                                 } else {
                                     renderMediaReadyRef.current = true;
                                     console.log('[webtorrent] streaming to video element via render-media');
+                                    // Mirror the MSE object URL into state so overlays update
+                                    const streamUrl = videoRef.current?.src;
+                                    if (streamUrl) {
+                                        setMovieBlobUrl(streamUrl);
+                                    }
                                 }
                             });
                         } catch (renderErr) {
-                            console.error('[webtorrent] render call failed:', renderErr);
+                            console.warn('[webtorrent] render call failed (non-fatal):', renderErr.message);
                             renderMediaReadyRef.current = false;
-                            // Don't create blob fallback — wait for download to complete.
                         }
                     }
                 }
@@ -409,8 +429,12 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                             name: videoFile?.name || sharedName || torrent.name,
                         });
 
-                        // Create stable blob URL now that the full file is available.
-                        createBlobUrlFallback(videoFile);
+                        // Create stable blob URL only if render-media did not attach.
+                        // If render-media is active the video is already playing via MSE —
+                        // changing the blob URL would reset playback.
+                        if (!renderMediaReadyRef.current) {
+                            createBlobUrlFallback(videoFile);
+                        }
 
                         // Expose for save-to-library prompt
                         if (videoFile) {
@@ -453,8 +477,9 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                             timestamp: Date.now(),
                         });
 
-                        if (videoRef?.current) {
-                            videoRef.current.play().catch(() => { });
+                        // render-media should have a source on the video element by now
+                        if (videoRef?.current?.src) {
+                            videoRef.current.play().catch(() => {});
                         }
                     }
                 });
