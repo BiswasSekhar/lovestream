@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { needsTransmux, transmuxToFMP4 } from '../../utils/mkvHandler.js';
-import { isNativeMP4, probeMP4 } from '../../utils/mp4Fragmenter.js';
+import { classifyFile } from '../../utils/streamRouter.js';
+import { transmuxToFMP4 } from '../../utils/mkvHandler.js';
+import { probeMP4 } from '../../utils/mp4Fragmenter.js';
 import { parseSubtitles } from '../../utils/subtitleParser.js';
 import { getTempMedia, removeTempMedia, saveTempMedia, TEMP_MEDIA_TTL_MS } from '../../utils/tempMediaCache.js';
 import { saveMovie, findMovie, loadMovie, listMovies, removeMovie, formatSize } from '../../utils/movieLibrary.js';
@@ -40,6 +41,7 @@ export default function VideoPlayer({
     const [libraryMovies, setLibraryMovies] = useState([]);
     const [showSaveOffer, setShowSaveOffer] = useState(null); // {blob, fileName}
     const [savedToLibNotice, setSavedToLibNotice] = useState('');
+    const [loadingLabel, setLoadingLabel] = useState('Processing movie...');
 
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
@@ -65,7 +67,7 @@ export default function VideoPlayer({
                 duration: 0,
             });
 
-            onFileReady?.(restoredFile, url, { preTranscode: false, restored: true });
+            onFileReady?.(restoredFile, url, { preTranscode: false, restored: true, streamPath: 'direct' });
         } catch (err) {
             console.error('[player] failed to restore cached host media:', err);
         }
@@ -109,7 +111,6 @@ export default function VideoPlayer({
     // Viewer: show save offer when download completes
     useEffect(() => {
         if (isHost || !completedDownload) return;
-        // Check if already in library first
         findMovie(completedDownload.fileName)
             .then((existing) => {
                 if (!existing) {
@@ -173,6 +174,7 @@ export default function VideoPlayer({
         try {
             setIsLoading(true);
             setLoadProgress(10);
+            setLoadingLabel('Loading from library...');
             const cached = await loadMovie(movie.key);
             if (!cached?.blob) {
                 setError('Library movie not found or corrupted');
@@ -192,7 +194,7 @@ export default function VideoPlayer({
                 duration: 0,
             });
 
-            onFileReady?.(file, url, { preTranscode: false, restored: true });
+            onFileReady?.(file, url, { preTranscode: false, restored: true, streamPath: 'direct' });
         } catch (err) {
             setError(`Failed to load from library: ${err.message}`);
             setIsLoading(false);
@@ -208,6 +210,14 @@ export default function VideoPlayer({
         }
     }, [refreshLibrary]);
 
+    /* ═══════════════════════════════════════════════════════════════
+     *  handleFileSelect — NEW: Uses streamRouter for smart routing
+     *
+     *  The key insight from torrent streaming sites:
+     *    - 'direct'    → Zero processing! Just play and seed immediately
+     *    - 'remux'     → Seed original immediately, viewer handles remux
+     *    - 'transcode' → Only path that waits for processing
+     * ═══════════════════════════════════════════════════════════════ */
     const handleFileSelect = useCallback(
         async (file) => {
             if (!file) return;
@@ -216,13 +226,19 @@ export default function VideoPlayer({
             setLoadProgress(0);
 
             try {
-                let url;
-                let processedFile = file;
-                let wasProcessed = false; // true if file was transcoded/remuxed
                 const hasNativeTranscoder = Boolean(window?.electron?.nativeTranscoder?.processFile);
 
-                /* ───── check library for cached processed version ───── */
-                if (needsTransmux(file) || (isNativeMP4(file) && !hasNativeTranscoder)) {
+                /* ─── Step 1: Classify the file ─── */
+                const classification = await classifyFile(file);
+                console.log('[player] File classification:', classification);
+
+                let url;
+                let processedFile = file;
+                let streamPath = classification.path;
+                let wasProcessed = false;
+
+                /* ─── check library for cached processed version ─── */
+                if (streamPath !== 'direct') {
                     const expectedName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                     try {
                         const libEntry = await findMovie(expectedName);
@@ -233,6 +249,7 @@ export default function VideoPlayer({
                                 const cachedFile = new File([cached.blob], cached.fileName, { type: cached.mimeType || 'video/mp4' });
                                 url = URL.createObjectURL(cachedFile);
                                 processedFile = cachedFile;
+                                streamPath = 'direct'; // cached version is already processed
                                 setLoadProgress(100);
 
                                 setLocalMovieUrl(url);
@@ -240,7 +257,7 @@ export default function VideoPlayer({
                                 setIsLoading(false);
 
                                 socket.current?.emit('movie-loaded', { name: file.name, duration: 0 });
-                                onFileReady?.(processedFile, url, { preTranscode: false, restored: true });
+                                onFileReady?.(processedFile, url, { preTranscode: false, restored: true, streamPath });
                                 return;
                             }
                         }
@@ -280,67 +297,71 @@ export default function VideoPlayer({
                     return { url: URL.createObjectURL(blob), file: outFile };
                 };
 
-                /* ───── helper: Native FFmpeg smart process (Electron only) ───── */
-                const nativeSmartProcess = async (inputFile) => {
-                    const inputPath = await resolveInputPath(inputFile);
-
-                    // Step 1: Fast remux — copy video, transcode audio to AAC (~5 seconds)
-                    console.log('[transcoder] Step 1: Fast remux (copy video, AAC audio):', inputPath);
-                    setLoadProgress(10);
-                    setPlaybackNotice('Remuxing to MP4 (fast)…');
-
-                    let result = await window.electron.nativeTranscoder.processFile(inputPath, false);
-                    if (!result?.success || !result.outputPath) {
-                        console.log('[transcoder] Step 1 remux failed — falling back to full transcode:', result?.error);
-                        setPlaybackNotice('Remux failed, transcoding to H.264 (native FFmpeg)…');
-                        result = await window.electron.nativeTranscoder.processFile(inputPath, true);
-                        if (!result?.success || !result.outputPath) {
-                            throw new Error(result?.error || 'Native transcode failed');
-                        }
-                    }
-
-                    setLoadProgress(60);
-                    let out = await readTranscoderOutput(result.outputPath, inputFile.name);
-
-                    // Step 2: Probe the remuxed output — check if HEVC
-                    const probeResult = await probeMP4(out.file);
-                    const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-
-                    if (probeResult.isHevc && !hevcSupported) {
-                        // HEVC detected and browser can't play it → full transcode
-                        console.log('[transcoder] Step 2: HEVC detected — full transcode to H.264…');
-                        setLoadProgress(10);
-                        setPlaybackNotice('Transcoding HEVC → H.264 (native FFmpeg)…');
-
-                        URL.revokeObjectURL(out.url);
-                        result = await window.electron.nativeTranscoder.processFile(inputPath, true);
-                        if (!result?.success || !result.outputPath) {
-                            throw new Error(result?.error || 'Native transcode failed');
-                        }
-
-                        setLoadProgress(80);
-                        out = await readTranscoderOutput(result.outputPath, inputFile.name);
-                    } else {
-                        console.log('[transcoder] Remux done — video is H.264 compatible, no transcode needed');
-                    }
-
-                    setPlaybackNotice('');
+                /* ═══════════════════════════════════════════
+                 *  PATH 1: DIRECT — Zero processing (instant!)
+                 *  This is what torrent streaming sites do for
+                 *  natively playable formats.
+                 * ═══════════════════════════════════════════ */
+                if (streamPath === 'direct') {
+                    console.log('[player] ✅ DIRECT path — zero processing, instant seed');
+                    url = URL.createObjectURL(file);
                     setLoadProgress(100);
-                    return out;
-                };
+                }
 
-                /* ─── 1. MKV / non-MP4 containers ─── */
-                if (needsTransmux(file)) {
+                /* ═══════════════════════════════════════════
+                 *  PATH 2: REMUX — Seed original, let viewer remux
+                 *  Host seeds the raw MKV/non-native container.
+                 *  Viewer uses mp4box.js → MSE for playback.
+                 *  Host still needs a playable URL for local preview.
+                 * ═══════════════════════════════════════════ */
+                else if (streamPath === 'remux') {
+                    console.log('[player] 🔄 REMUX path — seed original file, process for local preview');
+
                     if (hasNativeTranscoder) {
-                        /* Electron: native FFmpeg smart process — remux first, transcode only if HEVC */
-                        console.log('[player] MKV detected — using native transcoder');
-                        const out = await nativeSmartProcess(file);
-                        url = out.url;
-                        processedFile = out.file;
-                        wasProcessed = true;
+                        /* Electron: native FFmpeg smart process */
+                        setLoadingLabel('Remuxing to MP4 (fast)…');
+                        setLoadProgress(10);
+
+                        const inputPath = await resolveInputPath(file);
+                        let result = await window.electron.nativeTranscoder.processFile(inputPath, false);
+                        if (!result?.success || !result.outputPath) {
+                            console.warn('[transcoder] Remux failed, falling back to full transcode');
+                            setLoadingLabel('Transcoding (native FFmpeg)…');
+                            result = await window.electron.nativeTranscoder.processFile(inputPath, true);
+                            if (!result?.success || !result.outputPath) {
+                                throw new Error(result?.error || 'Native transcode failed');
+                            }
+                        }
+
+                        setLoadProgress(60);
+                        const out = await readTranscoderOutput(result.outputPath, file.name);
+
+                        // Check if HEVC
+                        const probeResult = await probeMP4(out.file);
+                        const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+
+                        if (probeResult.isHevc && !hevcSupported) {
+                            console.log('[transcoder] HEVC detected — full transcode to H.264…');
+                            setLoadingLabel('Transcoding HEVC → H.264…');
+                            setLoadProgress(10);
+                            URL.revokeObjectURL(out.url);
+                            result = await window.electron.nativeTranscoder.processFile(inputPath, true);
+                            if (!result?.success || !result.outputPath) {
+                                throw new Error(result?.error || 'Native transcode failed');
+                            }
+                            setLoadProgress(80);
+                            const out2 = await readTranscoderOutput(result.outputPath, file.name);
+                            url = out2.url;
+                            processedFile = out2.file;
+                            wasProcessed = true;
+                        } else {
+                            url = out.url;
+                            processedFile = out.file;
+                            wasProcessed = true;
+                        }
                     } else {
                         /* Browser fallback: ffmpeg.wasm */
-                        console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
+                        setLoadingLabel('Remuxing to MP4 (browser)…');
                         setLoadProgress(5);
 
                         let result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
@@ -348,8 +369,9 @@ export default function VideoPlayer({
                         if (result.isHevc) {
                             const hevcSupported = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
                             if (!hevcSupported) {
-                                console.log('[player] HEVC unsupported — transcoding video to H.264 for compatibility');
+                                console.log('[player] HEVC unsupported — transcoding to H.264');
                                 setLoadProgress(0);
+                                setLoadingLabel('Transcoding HEVC → H.264…');
                                 result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
                             }
                         }
@@ -361,63 +383,50 @@ export default function VideoPlayer({
                         processedFile = new File([blob], newName, { type: result.mime });
                         wasProcessed = true;
                     }
-                } else if (isNativeMP4(file)) {
-                    console.log('[player] MP4 detected — probing codecs…');
-                    setLoadProgress(5);
 
-                    const probeResult = await probeMP4(file);
-                    console.log('[player] Probe result:', probeResult);
+                    setLoadingLabel('Processing movie...');
+                    setLoadProgress(100);
+                }
 
-                    const needsVideoTranscode = probeResult.isHevc &&
-                        !MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-                    const needsAudioTranscode = !probeResult.hasAac;
+                /* ═══════════════════════════════════════════
+                 *  PATH 3: TRANSCODE — Full re-encode (last resort)
+                 *  Only for truly incompatible codecs (HEVC, etc).
+                 * ═══════════════════════════════════════════ */
+                else if (streamPath === 'transcode') {
+                    console.log('[player] ⚠️ TRANSCODE path —', classification.reason);
 
-                    if (needsVideoTranscode || needsAudioTranscode) {
-                        if (hasNativeTranscoder) {
-                            /* Electron: native FFmpeg smart process — remux or transcode as needed */
-                            const forceVideo = needsVideoTranscode;
-                            const label = forceVideo ? 'HEVC → H.264' : 'audio → AAC';
-                            console.log(`[player] MP4 needs ${label} — using native transcoder`);
-                            setPlaybackNotice(`Processing ${label} (native FFmpeg)…`);
+                    if (hasNativeTranscoder) {
+                        setLoadingLabel('Transcoding to H.264 (native)…');
+                        setLoadProgress(10);
 
-                            const inputPath = await resolveInputPath(file);
-                            const result = await window.electron.nativeTranscoder.processFile(inputPath, forceVideo);
-                            if (!result?.success || !result.outputPath) {
-                                throw new Error(result?.error || 'Native transcode failed');
-                            }
-
-                            setLoadProgress(80);
-                            const out = await readTranscoderOutput(result.outputPath, file.name);
-                            setPlaybackNotice('');
-                            setLoadProgress(100);
-                            url = out.url;
-                            processedFile = out.file;
-                            wasProcessed = true;
-                        } else {
-                            /* Browser fallback */
-                            if (needsVideoTranscode) {
-                                setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge.');
-                            }
-                            console.log('[player] MP4 needs transcode — using ffmpeg.wasm');
-                            setLoadProgress(10);
-                            const result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
-                            url = result.url;
-                            const response = await fetch(url);
-                            const blob = await response.blob();
-                            const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
-                            processedFile = new File([blob], newName, { type: result.mime });
-                            wasProcessed = true;
+                        const inputPath = await resolveInputPath(file);
+                        const result = await window.electron.nativeTranscoder.processFile(inputPath, true);
+                        if (!result?.success || !result.outputPath) {
+                            throw new Error(result?.error || 'Native transcode failed');
                         }
+
+                        setLoadProgress(80);
+                        const out = await readTranscoderOutput(result.outputPath, file.name);
+                        url = out.url;
+                        processedFile = out.file;
+                        wasProcessed = true;
+                        streamPath = 'direct'; // transcoded file is now directly playable
                     } else {
-                        /* Clean MP4 with H.264 + AAC: directly playable, no processing needed */
-                        console.log('[player] Clean MP4 (H.264 + AAC) — playing directly');
-                        url = URL.createObjectURL(file);
-                        setLoadProgress(100);
+                        setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge, or use the desktop app.');
+                        setLoadingLabel('Transcoding (browser)…');
+                        setLoadProgress(10);
+                        const result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
+                        url = result.url;
+                        const response = await fetch(url);
+                        const blob = await response.blob();
+                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                        processedFile = new File([blob], newName, { type: result.mime });
+                        wasProcessed = true;
+                        streamPath = 'direct'; // transcoded file is now directly playable
                     }
 
-                /* ─── 3. Other (e.g. WebM) — play directly ─── */
-                } else {
-                    url = URL.createObjectURL(file);
+                    setLoadingLabel('Processing movie...');
+                    setLoadProgress(100);
                 }
 
                 setLocalMovieUrl(url);
@@ -442,7 +451,10 @@ export default function VideoPlayer({
                     duration: 0,
                 });
 
-                onFileReady?.(processedFile, url, { preTranscode: false });
+                // For remux path: seed the ORIGINAL file (not the processed one)
+                // The viewer will handle remuxing on their end via mp4box.js → MSE
+                const fileToSeed = classification.path === 'remux' ? file : processedFile;
+                onFileReady?.(fileToSeed, url, { preTranscode: false, streamPath });
 
                 // Offer to save to library if the file was transcoded/remuxed
                 if (wasProcessed && isHost) {
@@ -501,8 +513,6 @@ export default function VideoPlayer({
 
     useEffect(() => {
         if (!isHost && movieBlobUrl && videoRef.current) {
-            // Only set src if it differs — render-media may already have set the
-            // same MSE URL, and overwriting would restart playback.
             if (videoRef.current.src !== movieBlobUrl) {
                 videoRef.current.src = movieBlobUrl;
             }
@@ -565,28 +575,28 @@ export default function VideoPlayer({
                 onDrop={handleDrop}
             >
                 <div className="player__dropzone-content">
-                        {cachedPrompt && (
-                            <div className="player__error" style={{ marginBottom: 12, textAlign: 'left' }}>
-                                <div style={{ marginBottom: 8 }}>
-                                    Resume cached movie: <strong>{cachedPrompt.fileName || 'movie.mp4'}</strong>
-                                </div>
-                                <div style={{ display: 'flex', gap: 8 }}>
-                                    <button className="player__browse-btn" onClick={() => restoreHostCachedMedia(cachedPrompt)}>
-                                        Resume
-                                    </button>
-                                    <button className="player__browse-btn" onClick={discardHostCachedMedia}>
-                                        Start Fresh
-                                    </button>
-                                </div>
+                    {cachedPrompt && (
+                        <div className="player__error" style={{ marginBottom: 12, textAlign: 'left' }}>
+                            <div style={{ marginBottom: 8 }}>
+                                Resume cached movie: <strong>{cachedPrompt.fileName || 'movie.mp4'}</strong>
                             </div>
-                        )}
+                            <div style={{ display: 'flex', gap: 8 }}>
+                                <button className="player__browse-btn" onClick={() => restoreHostCachedMedia(cachedPrompt)}>
+                                    Resume
+                                </button>
+                                <button className="player__browse-btn" onClick={discardHostCachedMedia}>
+                                    Start Fresh
+                                </button>
+                            </div>
+                        </div>
+                    )}
                     <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.6">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                         <polyline points="17 8 12 3 7 8" />
                         <line x1="12" y1="3" x2="12" y2="15" />
                     </svg>
                     <h3>Drop your movie here</h3>
-                    <p>Supports MP4 and MKV files</p>
+                    <p>Supports MP4, MKV, and WebM files</p>
                     <button className="player__browse-btn" onClick={() => fileInputRef.current?.click()}>
                         Browse Files
                     </button>
@@ -637,8 +647,8 @@ export default function VideoPlayer({
             <div className="player__loading">
                 <div className="player__loading-content">
                     <div className="player__spinner-large" />
-                    <h3>Processing movie...</h3>
-                    <p>Converting MKV for browser playback</p>
+                    <h3>{loadingLabel}</h3>
+                    <p>This only happens for non-native formats</p>
                     <div className="player__progress-bar">
                         <div className="player__progress-fill" style={{ width: `${loadProgress}%` }} />
                     </div>

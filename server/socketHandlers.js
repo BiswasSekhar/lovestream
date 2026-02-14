@@ -239,7 +239,7 @@ export default function registerSocketHandlers(io, roomManager) {
         });
 
         // ─── WebTorrent magnet sharing ──────────────────────────
-        socket.on('torrent-magnet', ({ magnetURI, preTranscode, name }) => {
+        socket.on('torrent-magnet', ({ magnetURI, preTranscode, name, streamPath }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
                 // Cache only finalized playable magnet for reconnect replay.
@@ -249,15 +249,17 @@ export default function registerSocketHandlers(io, roomManager) {
                             magnetURI,
                             preTranscode: false,
                             name: name || '',
+                            streamPath: streamPath || 'direct',
                         },
                     });
                 }
 
-                console.log(`[torrent] ${socket.id} sharing magnet in room ${room.code}`);
+                console.log(`[torrent] ${socket.id} sharing magnet in room ${room.code} (streamPath: ${streamPath || 'direct'})`);
                 socket.to(room.code).emit('torrent-magnet', {
                     magnetURI,
                     preTranscode: Boolean(preTranscode),
                     name: name || '',
+                    streamPath: streamPath || 'direct',
                 });
             }
         });

@@ -63,7 +63,7 @@ export default function Landing() {
                         </svg>
                     </div>
                     <h1 className="landing__title">Lovestream</h1>
-                    <p className="landing__tagline">Watch together, no matter the distance</p>
+                    <p className="landing__tagline">Your private cinema for two</p>
                 </div>
 
                 <div className="landing__card">
@@ -117,15 +117,29 @@ export default function Landing() {
 
                 <div className="landing__features">
                     <div className="landing__feature">
-                        <span className="landing__feature-icon">🎬</span>
-                        <span>Stream your movies P2P</span>
+                        <span className="landing__feature-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <polygon points="23 7 16 12 23 17 23 7" />
+                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                            </svg>
+                        </span>
+                        <span>Stream movies P2P</span>
                     </div>
                     <div className="landing__feature">
-                        <span className="landing__feature-icon">📹</span>
+                        <span className="landing__feature-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                                <circle cx="12" cy="7" r="4" />
+                            </svg>
+                        </span>
                         <span>Video call while watching</span>
                     </div>
                     <div className="landing__feature">
-                        <span className="landing__feature-icon">💬</span>
+                        <span className="landing__feature-icon">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+                            </svg>
+                        </span>
                         <span>Chat in real-time</span>
                     </div>
                 </div>

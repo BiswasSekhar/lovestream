@@ -16,3 +16,6 @@ client/electron-cache/
 # Tunnel files
 cloudflared.exe
 *.log
+
+# Agent skills
+.agent/skills

@@ -39,7 +39,7 @@ export default function Chat({ messages, onSend, role, onClose }) {
                 {messages.length === 0 && (
                     <div className="chat__empty">
                         <p>No messages yet</p>
-                        <p className="chat__empty-hint">Say hi to your partner! 💕</p>
+                        <p className="chat__empty-hint">Start the conversation</p>
                     </div>
                 )}
                 {messages.map((msg) => (

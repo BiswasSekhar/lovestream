@@ -3,15 +3,23 @@ import WebTorrent from 'webtorrent';
 import renderMedia from 'render-media';
 import { getTempMedia, saveTempMedia, updateTempMediaPosition, TEMP_MEDIA_TTL_MS } from '../utils/tempMediaCache.js';
 import { findMovie, loadMovie } from '../utils/movieLibrary.js';
+import { streamTorrentToMSE } from '../utils/mp4Fragmenter.js';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
 /**
  * Hook for P2P movie sharing via WebTorrent.
- * Replaces the old useFileStream (WebRTC DataChannel) approach.
  *
- * Host: seeds a file → shares magnetURI via socket.io → viewers download P2P
- * Viewers: receive magnetURI → download from host (and each other) → stream to <video>
+ * New streaming architecture (modelled after Stremio / Webtor / torrent streaming sites):
+ *
+ *   Host: ALWAYS seeds the original file immediately — no waiting for transcode.
+ *         Sends a `streamPath` alongside the magnet URI so the viewer knows
+ *         which playback pipeline to use.
+ *
+ *   Viewer receives magnet + streamPath and picks the right strategy:
+ *     - 'direct'    → render-media progressive MSE (works for MP4/WebM)
+ *     - 'remux'     → mp4box.js on-the-fly fragmentation → MSE SourceBuffer
+ *     - 'transcode' → waits for host's second (transcoded) magnet
  *
  * @param {object} params
  * @param {React.MutableRefObject} params.socket - Socket.IO ref
@@ -37,6 +45,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
     const activeMagnetRef = useRef(null);
     const lastPersistedPositionRef = useRef(0);
     const seededFileKeyRef = useRef('');
+    const mseAbortRef = useRef(null); // AbortController for MSE stream
 
     const buildFileKey = useCallback((file) => {
         if (!file) return '';
@@ -66,6 +75,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
         return () => {
             stopProgressUpdates();
+            mseAbortRef.current?.abort();
             if (clientRef.current) {
                 clientRef.current.destroy();
                 clientRef.current = null;
@@ -149,6 +159,10 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
             torrentRef.current = null;
         }
 
+        // Abort any active MSE stream
+        mseAbortRef.current?.abort();
+        mseAbortRef.current = null;
+
         activeMagnetRef.current = null;
         currentTorrentTokenRef.current += 1;
         stopProgressUpdates();
@@ -223,7 +237,9 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         return () => video.removeEventListener('timeupdate', persistPosition);
     }, [isHost, roomCode, videoRef]);
 
-    // Host: seed a file
+    /* ═══════════════════════════════════════════════════════════
+     *  Host: seed a file — ALWAYS seeds original immediately
+     * ═══════════════════════════════════════════════════════════ */
     const seedFile = useCallback((file, options = {}) => {
         const client = clientRef.current;
         const sock = socket?.current;
@@ -232,6 +248,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
             return;
         }
 
+        const streamPath = options.streamPath || 'direct';
         const isPreTranscodeSeed = Boolean(options.preTranscode);
         const fileKey = buildFileKey(file);
 
@@ -242,6 +259,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 sock.emit('torrent-magnet', {
                     magnetURI: existingMagnet,
                     preTranscode: false,
+                    streamPath,
                     name: file.name,
                 });
                 startProgressUpdates(torrentRef.current);
@@ -262,7 +280,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
         setIsSending(true);
         setDownloadProgress(0);
-        console.log('[webtorrent] seeding file:', file.name, 'size:', file.size);
+        console.log('[webtorrent] seeding file:', file.name, 'size:', file.size, 'streamPath:', streamPath);
 
         client.seed(file, {
             announce: [trackerUrl],
@@ -272,9 +290,11 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
             console.log('[webtorrent] seeding! magnetURI:', torrent.magnetURI);
 
             // Share magnet URI with viewers via socket.io
+            // Includes streamPath so viewer knows which playback pipeline to use
             sock.emit('torrent-magnet', {
                 magnetURI: torrent.magnetURI,
                 preTranscode: isPreTranscodeSeed,
+                streamPath,
                 name: file.name,
             });
 
@@ -289,7 +309,10 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         });
     }, [socket, trackerUrl, startProgressUpdates, buildFileKey]);
 
-    // Viewer: listen for magnet URI and start downloading
+    /* ═══════════════════════════════════════════════════════════
+     *  Viewer: listen for magnet URI and start downloading
+     *  Uses streamPath to pick the right playback pipeline
+     * ═══════════════════════════════════════════════════════════ */
     useEffect(() => {
         if (isHost) return;
         const sock = socket?.current;
@@ -305,16 +328,17 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
             const magnetURI = typeof payload === 'string' ? payload : payload?.magnetURI;
             const isPreTranscode = Boolean(payload?.preTranscode);
+            const streamPath = payload?.streamPath || 'direct';
             const sharedName = payload?.name || '';
             if (!magnetURI) return;
 
-            // Ignore duplicate finalized magnet replays to avoid restarting/losing current progress.
+            // Ignore duplicate finalized magnet replays
             if (!isPreTranscode && activeMagnetRef.current === magnetURI && torrentRef.current) {
                 console.log('[webtorrent] duplicate finalized magnet ignored');
                 return;
             }
 
-            console.log('[webtorrent] received magnet URI:', magnetURI, 'preTranscode:', isPreTranscode, 'name:', sharedName);
+            console.log('[webtorrent] received magnet URI:', magnetURI, 'streamPath:', streamPath, 'preTranscode:', isPreTranscode);
 
             // Check movie library before downloading
             if (!isPreTranscode && sharedName) {
@@ -342,7 +366,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 }
             }
 
-            // Remove any existing torrent (wait for destruction to avoid duplicate-add race)
+            // Remove any existing torrent
             if (torrentRef.current) {
                 try {
                     await new Promise((resolve) => {
@@ -352,7 +376,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 torrentRef.current = null;
             }
 
-            // If the client already has this torrent (e.g. reconnection with same file), reuse it
+            // Remove duplicate torrents
             const existingTorrent = client.torrents.find(
                 (t) => t.magnetURI === magnetURI || t.infoHash === magnetURI.match(/btih:([a-fA-F0-9]+)/)?.[1]
             );
@@ -363,6 +387,10 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                     });
                 } catch { }
             }
+
+            // Abort any previous MSE stream
+            mseAbortRef.current?.abort();
+            mseAbortRef.current = null;
 
             currentTorrentTokenRef.current += 1;
             const token = currentTorrentTokenRef.current;
@@ -383,7 +411,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 }
 
                 torrentRef.current = torrent;
-                console.log('[webtorrent] downloading:', torrent.name, 'files:', torrent.files.length);
+                console.log('[webtorrent] downloading:', torrent.name, 'files:', torrent.files.length, 'streamPath:', streamPath);
 
                 startProgressUpdates(torrent);
 
@@ -397,37 +425,47 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 if (videoFile) {
                     setMovieFileName(videoFile.name);
 
-                    // Pre-transcode phase is prefetch-only: do NOT attach to video element.
+                    // Pre-transcode phase: prefetch only, don't attach to player
                     if (isPreTranscode) {
-                        console.log('[webtorrent] pre-transcode prefetch phase active; skipping player attach');
+                        console.log('[webtorrent] pre-transcode prefetch phase; skipping player attach');
                     } else if (videoRef?.current) {
-                        // Progressive streaming via render-media (uses MSE internally).
-                        // The duplicate-torrent race is handled above, so pipe conflicts
-                        // should no longer occur.
-                        try {
-                            renderMedia.render(videoFile, videoRef.current, {
-                                autoplay: false,
-                                controls: false,
-                            }, (err) => {
+                        /* ─── Stream path routing (the torrent streaming site approach) ─── */
+
+                        if (streamPath === 'remux') {
+                            // MKV or non-native MP4: use on-the-fly remux via mp4box.js → MSE
+                            // This is what Stremio/Webtor do: fragment as pieces arrive
+                            console.log('[webtorrent] REMUX path: piping torrent → mp4box.js → MSE');
+
+                            const abortCtrl = new AbortController();
+                            mseAbortRef.current = abortCtrl;
+
+                            streamTorrentToMSE(videoFile, videoRef.current, {
+                                signal: abortCtrl.signal,
+                                onProgress: (p) => {
+                                    if (token !== currentTorrentTokenRef.current) return;
+                                    setDownloadProgress(p);
+                                },
+                            }).then(({ mime }) => {
                                 if (token !== currentTorrentTokenRef.current) return;
-                                if (err) {
-                                    console.warn('[webtorrent] renderMedia error (non-fatal):', err.message);
-                                    renderMediaReadyRef.current = false;
-                                    // Clear broken MSE URL so UI falls back to download progress
-                                    setMovieBlobUrl(null);
-                                } else {
-                                    renderMediaReadyRef.current = true;
-                                    console.log('[webtorrent] streaming to video element via render-media');
-                                    // Mirror the MSE object URL into state so overlays update
-                                    const streamUrl = videoRef.current?.src;
-                                    if (streamUrl) {
-                                        setMovieBlobUrl(streamUrl);
-                                    }
+                                renderMediaReadyRef.current = true;
+                                console.log('[webtorrent] MSE remux streaming active, mime:', mime);
+
+                                const streamUrl = videoRef.current?.src;
+                                if (streamUrl) {
+                                    setMovieBlobUrl(streamUrl);
                                 }
+                            }).catch((err) => {
+                                if (err.name === 'AbortError' || token !== currentTorrentTokenRef.current) return;
+                                console.warn('[webtorrent] MSE remux failed, falling back to render-media:', err.message);
+
+                                // Fallback to render-media
+                                attachRenderMedia(videoFile, token);
                             });
-                        } catch (renderErr) {
-                            console.warn('[webtorrent] render call failed (non-fatal):', renderErr.message);
-                            renderMediaReadyRef.current = false;
+
+                        } else {
+                            // 'direct' or 'transcode' (transcoded file is already MP4)
+                            // Use render-media for progressive MSE streaming (standard WebTorrent approach)
+                            attachRenderMedia(videoFile, token);
                         }
                     }
                 }
@@ -445,9 +483,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                             name: videoFile?.name || sharedName || torrent.name,
                         });
 
-                        // Create stable blob URL only if render-media did not attach.
-                        // If render-media is active the video is already playing via MSE —
-                        // changing the blob URL would reset playback.
+                        // Create stable blob URL only if render-media / MSE did not attach
                         if (!renderMediaReadyRef.current) {
                             createBlobUrlFallback(videoFile);
                         }
@@ -459,7 +495,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                                 const lower = (videoFile.name || '').toLowerCase();
                                 const mime = lower.endsWith('.webm') ? 'video/webm'
                                     : lower.endsWith('.mov') ? 'video/quicktime'
-                                    : 'video/mp4';
+                                        : 'video/mp4';
                                 const blob = new Blob([buf], { type: mime });
                                 setCompletedDownload({ blob, fileName: videoFile.name || sharedName || torrent.name });
                             } catch (e) {
@@ -493,14 +529,44 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                             timestamp: Date.now(),
                         });
 
-                        // render-media should have a source on the video element by now
+                        // Try to start playback
                         if (videoRef?.current?.src) {
-                            videoRef.current.play().catch(() => {});
+                            videoRef.current.play().catch(() => { });
                         }
                     }
                 });
 
             });
+        };
+
+        /** Helper: attach render-media for direct progressive streaming */
+        const attachRenderMedia = (videoFile, token) => {
+            if (!videoRef?.current) return;
+
+            console.log('[webtorrent] DIRECT path: using render-media for progressive MSE');
+            try {
+                renderMedia.render(videoFile, videoRef.current, {
+                    autoplay: false,
+                    controls: false,
+                }, (err) => {
+                    if (token !== currentTorrentTokenRef.current) return;
+                    if (err) {
+                        console.warn('[webtorrent] renderMedia error (non-fatal):', err.message);
+                        renderMediaReadyRef.current = false;
+                        setMovieBlobUrl(null);
+                    } else {
+                        renderMediaReadyRef.current = true;
+                        console.log('[webtorrent] streaming to video element via render-media');
+                        const streamUrl = videoRef.current?.src;
+                        if (streamUrl) {
+                            setMovieBlobUrl(streamUrl);
+                        }
+                    }
+                });
+            } catch (renderErr) {
+                console.warn('[webtorrent] render call failed (non-fatal):', renderErr.message);
+                renderMediaReadyRef.current = false;
+            }
         };
 
         sock.on('torrent-magnet', handleMagnet);

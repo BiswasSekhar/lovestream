@@ -160,7 +160,8 @@ function RoomContent() {
 
     useEffect(() => {
         if (!isHost || manualSeedMode || !pendingSeedFile) return;
-        seedFile(pendingSeedFile, { preTranscode: false });
+        const { file, streamPath } = pendingSeedFile;
+        seedFile(file, { preTranscode: false, streamPath });
         setPendingSeedFile(null);
     }, [isHost, manualSeedMode, pendingSeedFile, seedFile]);
 
@@ -204,6 +205,11 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock || !isConnected || !mediaReady) return;
 
+        let retryTimer = null;
+        let retryCount = 0;
+        const MAX_VIEWER_RETRIES = 5;
+        const RETRY_DELAY_MS = 3000;
+
         const handleJoinResponse = (response) => {
             if (!response.success) {
                 console.error('[room] failed to join:', response.error);
@@ -228,9 +234,23 @@ function RoomContent() {
                         }
                     });
                 }
+
+                // Viewer: room not found → host may not have re-created it yet, retry
+                if (!isHost && /not found/i.test(response.error || '') && retryCount < MAX_VIEWER_RETRIES) {
+                    retryCount++;
+                    console.log(`[room] viewer retrying join in ${RETRY_DELAY_MS}ms (attempt ${retryCount}/${MAX_VIEWER_RETRIES})`);
+                    retryTimer = setTimeout(() => {
+                        sock.emit('join-room', {
+                            code: roomCode,
+                            participantId: getParticipantId(),
+                            capabilities: getClientCapabilities(),
+                        }, handleJoinResponse);
+                    }, RETRY_DELAY_MS);
+                }
                 return;
             }
 
+            retryCount = 0;
             const serverRole = response?.room?.role;
             const mode = response?.mode || 'web-compatible';
             const reconnectGraceMs = response?.reconnectGraceMs || DEFAULT_RECONNECT_GRACE_MS;
@@ -242,6 +262,22 @@ function RoomContent() {
 
             console.log('[room] joined/rejoined, emitting ready-for-connection');
             sock.emit('ready-for-connection');
+
+            // After reconnect, host re-syncs playback position so viewer catches up
+            const videoEl = isHost ? hostVideoRef.current : viewerVideoRef.current;
+            if (isHost && videoEl && videoEl.currentTime > 0) {
+                setTimeout(() => {
+                    const time = videoEl.currentTime;
+                    const paused = videoEl.paused;
+                    console.log('[room] re-syncing playback position:', time, paused ? 'paused' : 'playing');
+                    sock.emit('sync-seek', { time, actionId: `resync-${Date.now()}` });
+                    if (!paused) {
+                        sock.emit('sync-play', { time, actionId: `resync-play-${Date.now()}` });
+                    } else {
+                        sock.emit('sync-pause', { time, actionId: `resync-pause-${Date.now()}` });
+                    }
+                }, 2000); // wait for viewer to also reconnect
+            }
         };
 
         sock.emit('join-room', {
@@ -249,6 +285,10 @@ function RoomContent() {
             participantId: getParticipantId(),
             capabilities: getClientCapabilities(),
         }, handleJoinResponse);
+
+        return () => {
+            if (retryTimer) clearTimeout(retryTimer);
+        };
     }, [isConnected, roomCode, socket, mediaReady, isHost, getParticipantId, getClientCapabilities]);
 
     useEffect(() => {
@@ -386,7 +426,7 @@ function RoomContent() {
         if (!sock) return;
 
         const handleDownloadComplete = ({ name }) => {
-            setDownloadCompleteToast(`✅ Download complete: ${name}`);
+            setDownloadCompleteToast(`Download complete: ${name}`);
             setTimeout(() => setDownloadCompleteToast(''), 3000);
         };
 
@@ -407,6 +447,7 @@ function RoomContent() {
     const handleFileReady = useCallback(
         (file, _url, options = {}) => {
             const isPreTranscodeSeed = Boolean(options.preTranscode);
+            const streamPath = options.streamPath || 'direct';
 
             // New movie selected: require fresh viewer buffer confirmation.
             // Reset on first (pre) seed phase so host cannot start too early.
@@ -424,22 +465,24 @@ function RoomContent() {
 
                 if (isHost && manualSeedMode) {
                     resetTransferState();
-                    setPendingSeedFile(file);
+                    setPendingSeedFile({ file, streamPath });
                     setDownloadCompleteToast('Movie ready. Click Start Seeding when you want to share.');
                     setTimeout(() => setDownloadCompleteToast(''), 2500);
                     return;
                 }
             }
 
-            // Seed current phase via WebTorrent.
-            seedFile(file, { preTranscode: isPreTranscodeSeed });
+            // Seed current phase via WebTorrent — include streamPath so viewer
+            // knows which playback pipeline to use (direct / remux / transcode).
+            seedFile(file, { preTranscode: isPreTranscodeSeed, streamPath });
         },
         [seedFile, isHost, manualSeedMode, resetTransferState]
     );
 
     const handleStartSeeding = useCallback(() => {
         if (!pendingSeedFile) return;
-        seedFile(pendingSeedFile, { preTranscode: false });
+        const { file, streamPath } = pendingSeedFile;
+        seedFile(file, { preTranscode: false, streamPath });
         setPendingSeedFile(null);
     }, [pendingSeedFile, seedFile]);
 
@@ -511,42 +554,16 @@ function RoomContent() {
     return (
         <div className={`room ${state.chatOpen ? 'room--chat-open' : ''}`}>
             {downloadCompleteToast && (
-                <div style={{
-                    position: 'fixed',
-                    top: 16,
-                    left: '50%',
-                    transform: 'translateX(-50%)',
-                    background: 'rgba(20,20,35,0.95)',
-                    border: '1px solid rgba(255,255,255,0.12)',
-                    borderRadius: 10,
-                    padding: '10px 14px',
-                    zIndex: 3000,
-                    fontSize: 13,
-                }}>
+                <div className="toast">
                     {downloadCompleteToast}
                 </div>
             )}
 
             {isHost && partnerDisconnected && (
-                <div style={{
-                    position: 'fixed',
-                    top: 56,
-                    left: '50%',
-                    transform: 'translateX(-50%)',
-                    background: 'rgba(20,20,35,0.95)',
-                    border: '1px solid rgba(255,255,255,0.12)',
-                    borderRadius: 10,
-                    padding: '10px 14px',
-                    zIndex: 3000,
-                    fontSize: 13,
-                    display: 'flex',
-                    gap: 8,
-                    alignItems: 'center',
-                }}>
+                <div className="toast toast--warning">
                     <span>Partner disconnected. Playback paused.</span>
                     <button
-                        className="landing__btn landing__btn--join"
-                        style={{ padding: '6px 10px', fontSize: 12 }}
+                        className="toast__btn"
                         onClick={() => setAllowSoloPlayback((v) => !v)}
                     >
                         {allowSoloPlayback ? 'Disable Solo Play' : 'Play Anyway'}
@@ -600,11 +617,21 @@ function RoomContent() {
                         </button>
                     )}
                     <span className="room__movie-name" title={`Room mode: ${roomMode}`}>
-                        {roomMode === 'native' ? '🖥️ Native Mode' : '🌐 Web Mode'}
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            {roomMode === 'native'
+                                ? <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                                : <circle cx="12" cy="12" r="10" />
+                            }
+                        </svg>
+                        {roomMode === 'native' ? 'Native' : 'Web'}
                     </span>
                     {state.movieName && (
                         <span className="room__movie-name" title={state.movieName}>
-                            🎬 {state.movieName}
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <polygon points="23 7 16 12 23 17 23 7" />
+                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                            </svg>
+                            {state.movieName}
                         </span>
                     )}
                     <button

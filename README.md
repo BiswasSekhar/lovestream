@@ -71,17 +71,27 @@ Want to use this *right now* without deploying to a server? We have a magic scri
 ## Deployment
 
 ### 1. Backend (The Signal Tower)
-*The backend is just a small signaling server. It doesn't handle video traffic.*
+*The backend is a small signaling server + WebTorrent tracker. No video traffic passes through it.*
 
-**Deploy to Render.com (Free Tier):**
-1. Create a new **Web Service** connected to your repo.
-2. Root Directory: `server`
-3. Build Command: `npm install`
-4. Start Command: `npm start`
-5. **Environment Variables:**
-   - `CLIENT_URL`: The URL of your frontend (e.g., `https://my-lovestream.vercel.app`)
-   - `PORT`: `3001`
-   - *(Optional) TURN config if needed*
+**Deploy to Koyeb (Free Tier — native WebSocket support):**
+1. Sign up at [koyeb.com](https://www.koyeb.com) and connect your GitHub account.
+2. Click **Create Service** → **Web Service** → select your Lovestream repo.
+3. Configure the service:
+   - **Work directory**: `server`
+   - **Builder**: Buildpack (auto-detects Node.js)
+   - **Run command**: `npm start`
+   - **Port**: `3001`
+4. **Environment Variables:**
+   | Variable | Value |
+   |---|---|
+   | `CLIENT_URL` | Your Vercel frontend URL (e.g., `https://lovestreamer.vercel.app`) |
+   | `PORT` | `3001` |
+   | `STUN_URL` | `stun:stun.l.google.com:19302` |
+   | `TURN_URL` | *(optional)* Your TURN server URL |
+   | `TURN_USERNAME` | *(optional)* TURN username |
+   | `TURN_CREDENTIAL` | *(optional)* TURN password |
+5. Click **Deploy**. Koyeb will build and start your service.
+6. Copy your service URL (e.g., `https://your-app-yourname.koyeb.app`).
 
 ### 2. Frontend (The Theater)
 **Deploy to Vercel (Free Tier):**
@@ -89,12 +99,12 @@ Want to use this *right now* without deploying to a server? We have a magic scri
 2. Root Directory: `client`
 3. Build Command: `npm run build`
 4. **Environment Variables:**
-   - `VITE_SERVER_URL`: The URL of your Render backend (e.g., `https://my-lovestream-api.onrender.com`)
+   - `VITE_SERVER_URL`: Your Koyeb backend URL (e.g., `https://your-app-yourname.koyeb.app`)
 
 ### 3. Connection Issues? (Optional TURN Server)
 If you can't connect (likely due to strict firewalls or mobile data), you need a TURN server.
 1. Sign up for a free account at [Metered.ca](https://metered.ca) (500MB free is plenty for signaling).
-2. Add these env vars to your **Backend (Render)**:
+2. Add these env vars to your **Backend (Koyeb)**:
    - `TURN_URL`: `turn:global.turn.metered.ca:80`
    - `TURN_USERNAME`: `your_metered_username`
    - `TURN_CREDENTIAL`: `your_metered_password`
