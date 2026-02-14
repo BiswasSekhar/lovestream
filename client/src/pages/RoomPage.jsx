@@ -77,7 +77,51 @@ function RoomContent() {
     const [partnerDisconnected, setPartnerDisconnected] = useState(false);
     const [allowSoloPlayback, setAllowSoloPlayback] = useState(false);
     const [roomMode, setRoomMode] = useState('web-compatible');
+    const [nativeVlcAvailable, setNativeVlcAvailable] = useState(false);
     const autoStartedRef = useRef(false);
+    const launchedNativeViewerSrcRef = useRef('');
+
+    const hasNativeVlcBridge = Boolean(window?.electron?.nativeVlc);
+
+    useEffect(() => {
+        if (!hasNativeVlcBridge) return;
+        window.electron.nativeVlc.isAvailable()
+            .then((result) => setNativeVlcAvailable(Boolean(result?.available)))
+            .catch(() => setNativeVlcAvailable(false));
+    }, [hasNativeVlcBridge]);
+
+    const openNativeVlc = useCallback(async (source, { fileName = 'movie.mp4', startTime = 0 } = {}) => {
+        if (!hasNativeVlcBridge || !window.electron?.nativeVlc) return false;
+
+        try {
+            if (typeof source === 'string' && source) {
+                const res = await window.electron.nativeVlc.playFile(source, startTime);
+                if (!res?.success) throw new Error(res?.error || 'Failed to play file in VLC');
+                return true;
+            }
+
+            const blobLike = source instanceof Blob ? source : null;
+            if (blobLike) {
+                const bytes = Array.from(new Uint8Array(await blobLike.arrayBuffer()));
+                const res = await window.electron.nativeVlc.playBuffer(bytes, fileName, startTime);
+                if (!res?.success) throw new Error(res?.error || 'Failed to play buffer in VLC');
+                return true;
+            }
+
+            if (source && typeof source.arrayBuffer === 'function') {
+                const bytes = Array.from(new Uint8Array(await source.arrayBuffer()));
+                const res = await window.electron.nativeVlc.playBuffer(bytes, source.name || fileName, startTime);
+                if (!res?.success) throw new Error(res?.error || 'Failed to play file buffer in VLC');
+                return true;
+            }
+        } catch (err) {
+            console.error('[native-vlc] open failed:', err);
+            setDownloadCompleteToast(`Native VLC failed: ${err?.message || err}`);
+            setTimeout(() => setDownloadCompleteToast(''), 3500);
+        }
+
+        return false;
+    }, [hasNativeVlcBridge]);
 
     useEffect(() => {
         setStoredRoomRole(roomCode, role, DEFAULT_RECONNECT_GRACE_MS);
@@ -296,6 +340,20 @@ function RoomContent() {
     }, [socket, dispatch, activeVideoRef]);
 
     useEffect(() => {
+        if (isHost) return;
+        if (roomMode !== 'native' || !nativeVlcAvailable) return;
+        if (!movieBlobUrl || launchedNativeViewerSrcRef.current === movieBlobUrl) return;
+
+        launchedNativeViewerSrcRef.current = movieBlobUrl;
+        fetch(movieBlobUrl)
+            .then((response) => response.blob())
+            .then((blob) => openNativeVlc(blob, { fileName: state.movieName || 'movie.mp4', startTime: currentTime || 0 }))
+            .catch((err) => {
+                console.error('[native-vlc] failed to load viewer blob:', err);
+            });
+    }, [isHost, roomMode, nativeVlcAvailable, movieBlobUrl, openNativeVlc, state.movieName, currentTime]);
+
+    useEffect(() => {
         const sock = socket.current;
         if (!sock) return;
 
@@ -496,6 +554,13 @@ function RoomContent() {
                     <span className="room__movie-name" title={`Room mode: ${roomMode}`}>
                         {roomMode === 'native' ? '🖥️ Native Mode' : '🌐 Web Mode'}
                     </span>
+                    {hasNativeVlcBridge && (
+                        <span className="room__movie-name" title={nativeVlcAvailable ? 'VLC bridge connected' : 'VLC bridge unavailable'}>
+                            {nativeVlcAvailable
+                                ? (roomMode === 'native' ? '🟢 VLC Active' : '🟢 VLC Local Ready')
+                                : '🟠 VLC Unavailable'}
+                        </span>
+                    )}
                     {state.movieName && (
                         <span className="room__movie-name" title={state.movieName}>
                             🎬 {state.movieName}
@@ -520,6 +585,7 @@ function RoomContent() {
                     <VideoPlayer
                         roomCode={roomCode}
                         isHost={isHost}
+                        roomMode={roomMode}
                         peerPlayableReady={!isHost || viewerPlayableReady}
                         allowHostSoloPlayback={allowSoloPlayback}
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
@@ -529,6 +595,7 @@ function RoomContent() {
                         numPeers={numPeers}
                         isReceiving={isReceiving}
                         onFileReady={handleFileReady}
+                        onNativePlayRequest={openNativeVlc}
                         onTimeUpdate={handleTimeUpdate}
                         onSubtitlesLoaded={handleSubtitlesLoaded}
                         playbackSync={playbackSync}

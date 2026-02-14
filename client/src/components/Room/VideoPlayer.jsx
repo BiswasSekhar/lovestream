@@ -8,6 +8,7 @@ import Controls from './Controls.jsx';
 export default function VideoPlayer({
     roomCode,
     isHost,
+    roomMode = 'web-compatible',
     peerPlayableReady = true,
     allowHostSoloPlayback = false,
     videoRef,
@@ -17,6 +18,7 @@ export default function VideoPlayer({
     numPeers,
     isReceiving,
     onFileReady,
+    onNativePlayRequest,
     onTimeUpdate,
     onSubtitlesLoaded,
     playbackSync,
@@ -53,11 +55,18 @@ export default function VideoPlayer({
                 duration: 0,
             });
 
+            if (roomMode === 'native') {
+                onNativePlayRequest?.(cached.sourcePath || restoredFile, {
+                    fileName: restoredFile.name,
+                    startTime: Number(cached.lastPosition || 0),
+                });
+            }
+
             onFileReady?.(restoredFile, url, { preTranscode: false, restored: true });
         } catch (err) {
             console.error('[player] failed to restore cached host media:', err);
         }
-    }, [socket, onFileReady]);
+    }, [socket, onFileReady, onNativePlayRequest, roomMode]);
 
     const discardHostCachedMedia = useCallback(async () => {
         if (!roomCode) return;
@@ -95,8 +104,13 @@ export default function VideoPlayer({
             try {
                 let url;
                 let processedFile = file;
+                const useNativePipeline = roomMode === 'native' && Boolean(window?.electron?.nativeVlc);
 
-                if (isNativeMP4(file)) {
+                if (useNativePipeline) {
+                    console.log('[player] native mode active — skipping browser transmux/transcode');
+                    url = URL.createObjectURL(file);
+                    processedFile = file;
+                } else if (isNativeMP4(file)) {
                     console.log('[player] MP4 detected — using mp4box.js (fast path)');
                     setLoadProgress(5);
 
@@ -161,6 +175,7 @@ export default function VideoPlayer({
                     role: 'host',
                     blob: processedFile,
                     fileName: processedFile.name,
+                    sourcePath: file.path || null,
                     ttlMs: TEMP_MEDIA_TTL_MS,
                 });
 
@@ -170,12 +185,19 @@ export default function VideoPlayer({
                 });
 
                 onFileReady?.(processedFile, url, { preTranscode: false });
+
+                if (roomMode === 'native') {
+                    onNativePlayRequest?.(file.path || processedFile, {
+                        fileName: processedFile.name,
+                        startTime: 0,
+                    });
+                }
             } catch (err) {
                 setError(`Failed to load movie: ${err.message}`);
                 setIsLoading(false);
             }
         },
-        [socket, onFileReady, roomCode]
+        [socket, onFileReady, roomCode, roomMode, onNativePlayRequest]
     );
 
     const handleSubtitleFile = useCallback(

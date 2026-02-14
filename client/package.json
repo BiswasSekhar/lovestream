@@ -17,6 +17,7 @@
     "build": {
         "appId": "com.lovestream.app",
         "productName": "Lovestream",
+        "npmRebuild": false,
         "directories": {
             "output": "dist_electron"
         },
@@ -53,6 +54,7 @@
         "@ffmpeg/core-mt": "^0.12.6",
         "@ffmpeg/ffmpeg": "^0.12.15",
         "@ffmpeg/util": "^0.12.2",
+        "@richienb/vlc": "^3.0.2",
         "buffer": "^6.0.3",
         "mp4box": "^2.3.0",
         "process": "^0.11.10",

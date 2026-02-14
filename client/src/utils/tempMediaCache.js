@@ -34,7 +34,7 @@ function transaction(storeName, mode, callback) {
     }));
 }
 
-export async function saveTempMedia({ roomCode, role, blob, fileName = 'movie.mp4', ttlMs = DEFAULT_TTL_MS }) {
+export async function saveTempMedia({ roomCode, role, blob, fileName = 'movie.mp4', sourcePath = null, ttlMs = DEFAULT_TTL_MS }) {
     if (!roomCode || !role || !blob) return;
 
     const now = Date.now();
@@ -43,6 +43,7 @@ export async function saveTempMedia({ roomCode, role, blob, fileName = 'movie.mp
         roomCode: String(roomCode).toUpperCase(),
         role,
         fileName,
+        sourcePath: sourcePath || null,
         mimeType: blob.type || 'video/mp4',
         size: blob.size || 0,
         blob,
