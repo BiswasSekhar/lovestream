@@ -82,6 +82,8 @@ function RoomContent() {
     const [manualSeedMode, setManualSeedMode] = useState(true);
     const [pendingSeedFile, setPendingSeedFile] = useState(null);
     const autoStartedRef = useRef(false);
+    const currentFileRef = useRef(null);
+    const seedFileRef = useRef(null);
 
     useEffect(() => {
         setStoredRoomRole(roomCode, role, DEFAULT_RECONNECT_GRACE_MS);
@@ -121,7 +123,7 @@ function RoomContent() {
                 // 3. Reseed file (if selected)
                 if (currentFileRef.current && !peerUsingLocalPlayback && !manualSeedMode) {
                     console.log('[room] peer connected, re-seeding current file');
-                    seedFile(currentFileRef.current);
+                    seedFileRef.current?.(currentFileRef.current);
                 }
             }
         },
@@ -151,6 +153,10 @@ function RoomContent() {
         videoRef: isHost ? hostVideoRef : viewerVideoRef,
         disableViewerTorrent: !isHost && usingLocalPlayback,
     });
+
+    useEffect(() => {
+        seedFileRef.current = seedFile;
+    }, [seedFile]);
 
     useEffect(() => {
         if (!isHost || manualSeedMode || !pendingSeedFile) return;
@@ -413,8 +419,6 @@ function RoomContent() {
         seedFile(pendingSeedFile, { preTranscode: false });
         setPendingSeedFile(null);
     }, [pendingSeedFile, seedFile]);
-
-    const currentFileRef = useRef(null);
 
     // Handle subtitles loaded by host
     const handleSubtitlesLoaded = useCallback(

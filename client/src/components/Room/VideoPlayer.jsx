@@ -509,16 +509,10 @@ export default function VideoPlayer({
         }
     }, [isHost, movieBlobUrl, videoRef]);
 
-    useEffect(() => {
+    const handleVideoTimeUpdate = useCallback(() => {
         const video = videoRef.current;
         if (!video) return;
-
-        const handleTime = () => {
-            onTimeUpdate?.(video.currentTime);
-        };
-
-        video.addEventListener('timeupdate', handleTime);
-        return () => video.removeEventListener('timeupdate', handleTime);
+        onTimeUpdate?.(video.currentTime);
     }, [videoRef, onTimeUpdate]);
 
     const handlePlay = useCallback(() => {
@@ -693,6 +687,7 @@ export default function VideoPlayer({
                 className="player__video"
                 {...videoSourceProps}
                 onLoadedMetadata={handleLoadedMetadata}
+                onTimeUpdate={handleVideoTimeUpdate}
                 onPlay={handlePlay}
                 onPause={handlePause}
                 onSeeked={handleSeek}
