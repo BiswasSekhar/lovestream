@@ -132,12 +132,6 @@ function RoomContent() {
         },
     });
 
-    useEffect(() => {
-        if (!isHost || manualSeedMode || !pendingSeedFile) return;
-        seedFile(pendingSeedFile, { preTranscode: false });
-        setPendingSeedFile(null);
-    }, [isHost, manualSeedMode, pendingSeedFile, seedFile]);
-
     // File streaming via WebTorrent (P2P)
     const {
         seedFile,
@@ -157,6 +151,12 @@ function RoomContent() {
         videoRef: isHost ? hostVideoRef : viewerVideoRef,
         disableViewerTorrent: !isHost && usingLocalPlayback,
     });
+
+    useEffect(() => {
+        if (!isHost || manualSeedMode || !pendingSeedFile) return;
+        seedFile(pendingSeedFile, { preTranscode: false });
+        setPendingSeedFile(null);
+    }, [isHost, manualSeedMode, pendingSeedFile, seedFile]);
 
     // Playback sync
     const playbackSync = usePlaybackSync({
