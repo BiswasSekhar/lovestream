@@ -152,6 +152,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         activeMagnetRef.current = null;
         currentTorrentTokenRef.current += 1;
         stopProgressUpdates();
+        setIsSending(false);
         setIsReceiving(false);
         setDownloadProgress(0);
         setTransferSpeed(0);

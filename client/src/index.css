@@ -534,6 +534,33 @@ a {
   white-space: nowrap;
 }
 
+.room__seed-toggle,
+.room__seed-start {
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  background: var(--bg-glass);
+  transition: all var(--transition-fast);
+}
+
+.room__seed-toggle:hover,
+.room__seed-start:hover {
+  color: var(--text-primary);
+  background: var(--bg-elevated);
+}
+
+.room__seed-toggle--active {
+  border-color: rgba(34, 197, 94, 0.45);
+  color: var(--success);
+}
+
+.room__seed-start {
+  border-color: rgba(139, 92, 246, 0.5);
+  color: var(--accent-purple);
+}
+
 .room__chat-toggle {
   position: relative;
   padding: var(--space-sm);
@@ -1086,6 +1113,15 @@ a {
   border: 1px solid var(--border-color);
   border-radius: 9999px;
   z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
+}
+
+.videocall:hover .videocall__controls,
+.videocall:focus-within .videocall__controls {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .videocall__btn {

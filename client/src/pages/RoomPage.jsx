@@ -79,6 +79,8 @@ function RoomContent() {
     const [roomMode, setRoomMode] = useState('web-compatible');
     const [usingLocalPlayback, setUsingLocalPlayback] = useState(false);
     const [peerUsingLocalPlayback, setPeerUsingLocalPlayback] = useState(false);
+    const [manualSeedMode, setManualSeedMode] = useState(true);
+    const [pendingSeedFile, setPendingSeedFile] = useState(null);
     const autoStartedRef = useRef(false);
 
     useEffect(() => {
@@ -117,7 +119,7 @@ function RoomContent() {
                 }
 
                 // 3. Reseed file (if selected)
-                if (currentFileRef.current && !peerUsingLocalPlayback) {
+                if (currentFileRef.current && !peerUsingLocalPlayback && !manualSeedMode) {
                     console.log('[room] peer connected, re-seeding current file');
                     seedFile(currentFileRef.current);
                 }
@@ -129,6 +131,12 @@ function RoomContent() {
             setRemoteCallStream(null);
         },
     });
+
+    useEffect(() => {
+        if (!isHost || manualSeedMode || !pendingSeedFile) return;
+        seedFile(pendingSeedFile, { preTranscode: false });
+        setPendingSeedFile(null);
+    }, [isHost, manualSeedMode, pendingSeedFile, seedFile]);
 
     // File streaming via WebTorrent (P2P)
     const {
@@ -384,13 +392,27 @@ function RoomContent() {
             // Keep reconnection source as finalized file only.
             if (!isPreTranscodeSeed) {
                 currentFileRef.current = file;
+
+                if (isHost && manualSeedMode) {
+                    resetTransferState();
+                    setPendingSeedFile(file);
+                    setDownloadCompleteToast('Movie ready. Click Start Seeding when you want to share.');
+                    setTimeout(() => setDownloadCompleteToast(''), 2500);
+                    return;
+                }
             }
 
             // Seed current phase via WebTorrent.
             seedFile(file, { preTranscode: isPreTranscodeSeed });
         },
-        [seedFile, isHost]
+        [seedFile, isHost, manualSeedMode, resetTransferState]
     );
+
+    const handleStartSeeding = useCallback(() => {
+        if (!pendingSeedFile) return;
+        seedFile(pendingSeedFile, { preTranscode: false });
+        setPendingSeedFile(null);
+    }, [pendingSeedFile, seedFile]);
 
     const currentFileRef = useRef(null);
 
@@ -532,6 +554,24 @@ function RoomContent() {
                     </div>
                 </div>
                 <div className="room__header-right">
+                    {isHost && (
+                        <button
+                            className={`room__seed-toggle ${manualSeedMode ? 'room__seed-toggle--active' : ''}`}
+                            onClick={() => setManualSeedMode((v) => !v)}
+                            title="Toggle manual seeding mode"
+                        >
+                            {manualSeedMode ? 'Manual Seed: ON' : 'Manual Seed: OFF'}
+                        </button>
+                    )}
+                    {isHost && manualSeedMode && pendingSeedFile && (
+                        <button
+                            className="room__seed-start"
+                            onClick={handleStartSeeding}
+                            title="Start seeding now"
+                        >
+                            Start Seeding
+                        </button>
+                    )}
                     <span className="room__movie-name" title={`Room mode: ${roomMode}`}>
                         {roomMode === 'native' ? '🖥️ Native Mode' : '🌐 Web Mode'}
                     </span>
