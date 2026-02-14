@@ -151,7 +151,7 @@ function registerVlcIpc() {
         const tempDir = path.join(os.tmpdir(), 'lovestream-vlc');
         fs.mkdirSync(tempDir, { recursive: true });
         const outputPath = path.join(tempDir, `${Date.now()}.mp4`);
-        const outputPathForVlc = outputPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+        const outputPathForVlc = outputPath.replace(/\\/g, '/');
 
         const mode = forceVideoTranscode ? 'full transcode (H.264+AAC)' : 'fast remux (copy video, AAC audio)';
         console.log(`[vlc] ${mode}`);
@@ -165,19 +165,18 @@ function registerVlcIpc() {
                 sout = [
                     '#transcode{vcodec=h264,venc=x264{preset=ultrafast},',
                     'acodec=aac,ab=192,channels=2,samplerate=48000}',
-                    `:standard{access=file,mux=mp4,dst=${outputPathForVlc}}`
+                    `:standard{access=file,mux=mp4,dst='${outputPathForVlc}'}`
                 ].join('');
             } else {
                 // Fast remux: copy video streams as-is, only transcode audio to AAC
                 sout = [
                     '#transcode{vcodec=copy,acodec=aac,ab=192,channels=2,samplerate=48000,scodec=none}',
-                    `:standard{access=file,mux=mp4,dst=${outputPathForVlc}}`
+                    `:standard{access=file,mux=mp4,dst='${outputPathForVlc}'}`
                 ].join('');
             }
 
             const args = [
                 '-I', 'dummy',
-                '--quiet',
                 '--no-video-title-show',
                 '--no-repeat',
                 '--no-loop',
@@ -214,7 +213,11 @@ function registerVlcIpc() {
                     finalize({ success: true, outputPath });
                 } else {
                     console.error('[vlc] Failed. code:', code, stderr.slice(-500) || stdout.slice(-500));
-                    finalize({ success: false, error: `VLC exited ${code}: ${(stderr || stdout).slice(-300)}` });
+                    const details = (stderr || stdout).slice(-300);
+                    const message = details
+                        ? `VLC exited ${code}: ${details}`
+                        : `VLC exited ${code} without producing output file`;
+                    finalize({ success: false, error: message });
                 }
             });
 
@@ -231,7 +234,8 @@ function registerVlcIpc() {
             if (!filePath || !fs.existsSync(filePath))
                 return { success: false, error: 'File not found' };
             const data = fs.readFileSync(filePath);
-            return { success: true, data: data.buffer };
+            const bytes = Uint8Array.from(data);
+            return { success: true, bytes };
         } catch (err) {
             return { success: false, error: err.message };
         }

@@ -125,10 +125,13 @@ export default function VideoPlayer({
                 /* ───── helper: read VLC output into a File ───── */
                 const readVlcOutput = async (outputPath, originalName) => {
                     const fileData = await window.electron.nativeVlc.readFile(outputPath);
-                    if (!fileData?.success || !fileData.data) {
+                    if (!fileData?.success || (!fileData.bytes && !fileData.data)) {
                         throw new Error('Failed to read VLC output');
                     }
-                    const blob = new Blob([new Uint8Array(fileData.data)], { type: 'video/mp4' });
+                    const bytes = fileData.bytes
+                        ? new Uint8Array(fileData.bytes)
+                        : new Uint8Array(fileData.data);
+                    const blob = new Blob([bytes], { type: 'video/mp4' });
                     const newName = originalName.replace(/\.[^/.]+$/, '') + '.mp4';
                     const outFile = new File([blob], newName, { type: 'video/mp4' });
                     return { url: URL.createObjectURL(blob), file: outFile };
@@ -145,7 +148,12 @@ export default function VideoPlayer({
 
                     let result = await window.electron.nativeVlc.processFile(inputPath, false);
                     if (!result?.success || !result.outputPath) {
-                        throw new Error(result?.error || 'VLC remux failed');
+                        console.log('[vlc] Step 1 remux failed — falling back to full transcode:', result?.error);
+                        setPlaybackNotice('Remux failed, transcoding to H.264 (VLC native)…');
+                        result = await window.electron.nativeVlc.processFile(inputPath, true);
+                        if (!result?.success || !result.outputPath) {
+                            throw new Error(result?.error || 'VLC transcode failed');
+                        }
                     }
 
                     setLoadProgress(60);
