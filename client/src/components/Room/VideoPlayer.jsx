@@ -1,14 +1,14 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { needsTransmux, transmuxToFMP4 } from '../../utils/mkvHandler.js';
-import { fragmentMP4, isNativeMP4, probeMP4 } from '../../utils/mp4Fragmenter.js';
+import { isNativeMP4, probeMP4 } from '../../utils/mp4Fragmenter.js';
 import { parseSubtitles } from '../../utils/subtitleParser.js';
 import { getTempMedia, removeTempMedia, saveTempMedia, TEMP_MEDIA_TTL_MS } from '../../utils/tempMediaCache.js';
+import { saveMovie, findMovie, loadMovie, listMovies, removeMovie, formatSize } from '../../utils/movieLibrary.js';
 import Controls from './Controls.jsx';
 
 export default function VideoPlayer({
     roomCode,
     isHost,
-    roomMode = 'web-compatible',
     peerPlayableReady = true,
     allowHostSoloPlayback = false,
     videoRef,
@@ -18,11 +18,12 @@ export default function VideoPlayer({
     numPeers,
     isReceiving,
     onFileReady,
-    onNativePlayRequest,
     onTimeUpdate,
     onSubtitlesLoaded,
     playbackSync,
     socket,
+    completedDownload,
+    clearCompletedDownload,
 }) {
     const [localMovieUrl, setLocalMovieUrl] = useState(null);
     const [isLoading, setIsLoading] = useState(false);
@@ -31,6 +32,9 @@ export default function VideoPlayer({
     const [isDragging, setIsDragging] = useState(false);
     const [playbackNotice, setPlaybackNotice] = useState('');
     const [cachedPrompt, setCachedPrompt] = useState(null);
+    const [libraryMovies, setLibraryMovies] = useState([]);
+    const [showSaveOffer, setShowSaveOffer] = useState(null); // {blob, fileName}
+    const [savedToLibNotice, setSavedToLibNotice] = useState('');
 
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
@@ -55,18 +59,11 @@ export default function VideoPlayer({
                 duration: 0,
             });
 
-            if (roomMode === 'native') {
-                onNativePlayRequest?.(cached.sourcePath || restoredFile, {
-                    fileName: restoredFile.name,
-                    startTime: Number(cached.lastPosition || 0),
-                });
-            }
-
             onFileReady?.(restoredFile, url, { preTranscode: false, restored: true });
         } catch (err) {
             console.error('[player] failed to restore cached host media:', err);
         }
-    }, [socket, onFileReady, onNativePlayRequest, roomMode]);
+    }, [socket, onFileReady]);
 
     const discardHostCachedMedia = useCallback(async () => {
         if (!roomCode) return;
@@ -94,6 +91,92 @@ export default function VideoPlayer({
             });
     }, [isHost, roomCode, localMovieUrl, isLoading]);
 
+    // Load library list for host file-selection screen
+    const refreshLibrary = useCallback(() => {
+        listMovies().then(setLibraryMovies).catch(() => setLibraryMovies([]));
+    }, []);
+
+    useEffect(() => {
+        refreshLibrary();
+    }, [refreshLibrary]);
+
+    // Viewer: show save offer when download completes
+    useEffect(() => {
+        if (isHost || !completedDownload) return;
+        // Check if already in library first
+        findMovie(completedDownload.fileName)
+            .then((existing) => {
+                if (!existing) {
+                    setShowSaveOffer(completedDownload);
+                }
+            })
+            .catch(() => {
+                setShowSaveOffer(completedDownload);
+            });
+    }, [isHost, completedDownload]);
+
+    // Handle saving to library
+    const handleSaveToLibrary = useCallback(async (data) => {
+        if (!data?.blob || !data?.fileName) return;
+        try {
+            await saveMovie(data.blob, data.fileName);
+            setSavedToLibNotice(`Saved "${data.fileName}" to library`);
+            setTimeout(() => setSavedToLibNotice(''), 3000);
+            setShowSaveOffer(null);
+            clearCompletedDownload?.();
+            refreshLibrary();
+        } catch (err) {
+            console.error('[player] failed to save to library:', err);
+            setError(`Failed to save to library: ${err.message}`);
+            setShowSaveOffer(null);
+        }
+    }, [clearCompletedDownload, refreshLibrary]);
+
+    const handleDismissSaveOffer = useCallback(() => {
+        setShowSaveOffer(null);
+        clearCompletedDownload?.();
+    }, [clearCompletedDownload]);
+
+    // Load movie from library
+    const handleLoadFromLibrary = useCallback(async (movie) => {
+        try {
+            setIsLoading(true);
+            setLoadProgress(10);
+            const cached = await loadMovie(movie.key);
+            if (!cached?.blob) {
+                setError('Library movie not found or corrupted');
+                setIsLoading(false);
+                return;
+            }
+
+            const file = new File([cached.blob], cached.fileName, { type: cached.mimeType || 'video/mp4' });
+            const url = URL.createObjectURL(file);
+            setLocalMovieUrl(url);
+            selectedFileRef.current = file;
+            setIsLoading(false);
+            setLoadProgress(100);
+
+            socket.current?.emit('movie-loaded', {
+                name: cached.fileName,
+                duration: 0,
+            });
+
+            onFileReady?.(file, url, { preTranscode: false, restored: true });
+        } catch (err) {
+            setError(`Failed to load from library: ${err.message}`);
+            setIsLoading(false);
+        }
+    }, [socket, onFileReady]);
+
+    const handleRemoveFromLibrary = useCallback(async (movie) => {
+        try {
+            await removeMovie(movie.key);
+            refreshLibrary();
+        } catch (err) {
+            console.error('[player] failed to remove from library:', err);
+        }
+    }, [refreshLibrary]);
+
     const handleFileSelect = useCallback(
         async (file) => {
             if (!file) return;
@@ -104,15 +187,44 @@ export default function VideoPlayer({
             try {
                 let url;
                 let processedFile = file;
-                const hasVlcProcess = Boolean(window?.electron?.nativeVlc?.processFile);
+                let wasProcessed = false; // true if file was transcoded/remuxed
+                const hasNativeTranscoder = Boolean(window?.electron?.nativeTranscoder?.processFile);
 
-                /* ───── helper: resolve input path for VLC ───── */
+                /* ───── check library for cached processed version ───── */
+                if (needsTransmux(file) || (isNativeMP4(file) && !hasNativeTranscoder)) {
+                    const expectedName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
+                    try {
+                        const libEntry = await findMovie(expectedName);
+                        if (libEntry) {
+                            console.log('[player] Found processed version in library:', expectedName);
+                            const cached = await loadMovie(libEntry.key);
+                            if (cached?.blob) {
+                                const cachedFile = new File([cached.blob], cached.fileName, { type: cached.mimeType || 'video/mp4' });
+                                url = URL.createObjectURL(cachedFile);
+                                processedFile = cachedFile;
+                                setLoadProgress(100);
+
+                                setLocalMovieUrl(url);
+                                selectedFileRef.current = processedFile;
+                                setIsLoading(false);
+
+                                socket.current?.emit('movie-loaded', { name: file.name, duration: 0 });
+                                onFileReady?.(processedFile, url, { preTranscode: false, restored: true });
+                                return;
+                            }
+                        }
+                    } catch (err) {
+                        console.warn('[player] library check failed:', err);
+                    }
+                }
+
+                /* ───── helper: resolve input path for native transcoder ───── */
                 const resolveInputPath = async (inputFile) => {
                     let inputPath = inputFile.path || null;
                     if (!inputPath) {
-                        console.log('[vlc] No file.path — saving to temp…');
+                        console.log('[transcoder] No file.path — saving to temp…');
                         const buf = await inputFile.arrayBuffer();
-                        const saved = await window.electron.nativeVlc.saveTempFile(
+                        const saved = await window.electron.nativeTranscoder.saveTempFile(
                             new Uint8Array(buf),
                             inputFile.name,
                         );
@@ -122,11 +234,11 @@ export default function VideoPlayer({
                     return inputPath;
                 };
 
-                /* ───── helper: read VLC output into a File ───── */
-                const readVlcOutput = async (outputPath, originalName) => {
-                    const fileData = await window.electron.nativeVlc.readFile(outputPath);
+                /* ───── helper: read transcoder output into a File ───── */
+                const readTranscoderOutput = async (outputPath, originalName) => {
+                    const fileData = await window.electron.nativeTranscoder.readFile(outputPath);
                     if (!fileData?.success || (!fileData.bytes && !fileData.data)) {
-                        throw new Error('Failed to read VLC output');
+                        throw new Error('Failed to read transcoder output');
                     }
                     const bytes = fileData.bytes
                         ? new Uint8Array(fileData.bytes)
@@ -137,27 +249,27 @@ export default function VideoPlayer({
                     return { url: URL.createObjectURL(blob), file: outFile };
                 };
 
-                /* ───── helper: VLC smart process (Electron only) ───── */
-                const vlcSmartProcess = async (inputFile) => {
+                /* ───── helper: Native FFmpeg smart process (Electron only) ───── */
+                const nativeSmartProcess = async (inputFile) => {
                     const inputPath = await resolveInputPath(inputFile);
 
                     // Step 1: Fast remux — copy video, transcode audio to AAC (~5 seconds)
-                    console.log('[vlc] Step 1: Fast remux (copy video, AAC audio):', inputPath);
+                    console.log('[transcoder] Step 1: Fast remux (copy video, AAC audio):', inputPath);
                     setLoadProgress(10);
                     setPlaybackNotice('Remuxing to MP4 (fast)…');
 
-                    let result = await window.electron.nativeVlc.processFile(inputPath, false);
+                    let result = await window.electron.nativeTranscoder.processFile(inputPath, false);
                     if (!result?.success || !result.outputPath) {
-                        console.log('[vlc] Step 1 remux failed — falling back to full transcode:', result?.error);
-                        setPlaybackNotice('Remux failed, transcoding to H.264 (VLC native)…');
-                        result = await window.electron.nativeVlc.processFile(inputPath, true);
+                        console.log('[transcoder] Step 1 remux failed — falling back to full transcode:', result?.error);
+                        setPlaybackNotice('Remux failed, transcoding to H.264 (native FFmpeg)…');
+                        result = await window.electron.nativeTranscoder.processFile(inputPath, true);
                         if (!result?.success || !result.outputPath) {
-                            throw new Error(result?.error || 'VLC transcode failed');
+                            throw new Error(result?.error || 'Native transcode failed');
                         }
                     }
 
                     setLoadProgress(60);
-                    let out = await readVlcOutput(result.outputPath, inputFile.name);
+                    let out = await readTranscoderOutput(result.outputPath, inputFile.name);
 
                     // Step 2: Probe the remuxed output — check if HEVC
                     const probeResult = await probeMP4(out.file);
@@ -165,20 +277,20 @@ export default function VideoPlayer({
 
                     if (probeResult.isHevc && !hevcSupported) {
                         // HEVC detected and browser can't play it → full transcode
-                        console.log('[vlc] Step 2: HEVC detected — full transcode to H.264…');
+                        console.log('[transcoder] Step 2: HEVC detected — full transcode to H.264…');
                         setLoadProgress(10);
-                        setPlaybackNotice('Transcoding HEVC → H.264 (VLC native)…');
+                        setPlaybackNotice('Transcoding HEVC → H.264 (native FFmpeg)…');
 
                         URL.revokeObjectURL(out.url);
-                        result = await window.electron.nativeVlc.processFile(inputPath, true);
+                        result = await window.electron.nativeTranscoder.processFile(inputPath, true);
                         if (!result?.success || !result.outputPath) {
-                            throw new Error(result?.error || 'VLC transcode failed');
+                            throw new Error(result?.error || 'Native transcode failed');
                         }
 
                         setLoadProgress(80);
-                        out = await readVlcOutput(result.outputPath, inputFile.name);
+                        out = await readTranscoderOutput(result.outputPath, inputFile.name);
                     } else {
-                        console.log('[vlc] Remux done — video is H.264 compatible, no transcode needed');
+                        console.log('[transcoder] Remux done — video is H.264 compatible, no transcode needed');
                     }
 
                     setPlaybackNotice('');
@@ -188,12 +300,13 @@ export default function VideoPlayer({
 
                 /* ─── 1. MKV / non-MP4 containers ─── */
                 if (needsTransmux(file)) {
-                    if (hasVlcProcess) {
-                        /* Electron: VLC smart process — remux first, transcode only if HEVC */
-                        console.log('[player] MKV detected — using VLC smart process');
-                        const out = await vlcSmartProcess(file);
+                    if (hasNativeTranscoder) {
+                        /* Electron: native FFmpeg smart process — remux first, transcode only if HEVC */
+                        console.log('[player] MKV detected — using native transcoder');
+                        const out = await nativeSmartProcess(file);
                         url = out.url;
                         processedFile = out.file;
+                        wasProcessed = true;
                     } else {
                         /* Browser fallback: ffmpeg.wasm */
                         console.log('[player] MKV detected — using ffmpeg.wasm (remux path)');
@@ -215,9 +328,8 @@ export default function VideoPlayer({
                         const blob = await response.blob();
                         const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                         processedFile = new File([blob], newName, { type: result.mime });
+                        wasProcessed = true;
                     }
-
-                /* ─── 2. MP4 containers ─── */
                 } else if (isNativeMP4(file)) {
                     console.log('[player] MP4 detected — probing codecs…');
                     setLoadProgress(5);
@@ -230,25 +342,26 @@ export default function VideoPlayer({
                     const needsAudioTranscode = !probeResult.hasAac;
 
                     if (needsVideoTranscode || needsAudioTranscode) {
-                        if (hasVlcProcess) {
-                            /* Electron: VLC smart process — remux or transcode as needed */
+                        if (hasNativeTranscoder) {
+                            /* Electron: native FFmpeg smart process — remux or transcode as needed */
                             const forceVideo = needsVideoTranscode;
                             const label = forceVideo ? 'HEVC → H.264' : 'audio → AAC';
-                            console.log(`[player] MP4 needs ${label} — using VLC native`);
-                            setPlaybackNotice(`Processing ${label} (VLC native)…`);
+                            console.log(`[player] MP4 needs ${label} — using native transcoder`);
+                            setPlaybackNotice(`Processing ${label} (native FFmpeg)…`);
 
                             const inputPath = await resolveInputPath(file);
-                            const result = await window.electron.nativeVlc.processFile(inputPath, forceVideo);
+                            const result = await window.electron.nativeTranscoder.processFile(inputPath, forceVideo);
                             if (!result?.success || !result.outputPath) {
-                                throw new Error(result?.error || 'VLC process failed');
+                                throw new Error(result?.error || 'Native transcode failed');
                             }
 
                             setLoadProgress(80);
-                            const out = await readVlcOutput(result.outputPath, file.name);
+                            const out = await readTranscoderOutput(result.outputPath, file.name);
                             setPlaybackNotice('');
                             setLoadProgress(100);
                             url = out.url;
                             processedFile = out.file;
+                            wasProcessed = true;
                         } else {
                             /* Browser fallback */
                             if (needsVideoTranscode) {
@@ -262,15 +375,13 @@ export default function VideoPlayer({
                             const blob = await response.blob();
                             const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
                             processedFile = new File([blob], newName, { type: result.mime });
+                            wasProcessed = true;
                         }
                     } else {
-                        /* Clean MP4 with H.264 + AAC: fast mp4box fragmentation (no transcode) */
-                        const result = await fragmentMP4(file, (p) => setLoadProgress(p));
-                        url = result.url;
-                        const response = await fetch(url);
-                        const blob = await response.blob();
-                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
-                        processedFile = new File([blob], newName, { type: result.mime });
+                        /* Clean MP4 with H.264 + AAC: directly playable, no processing needed */
+                        console.log('[player] Clean MP4 (H.264 + AAC) — playing directly');
+                        url = URL.createObjectURL(file);
+                        setLoadProgress(100);
                     }
 
                 /* ─── 3. Other (e.g. WebM) — play directly ─── */
@@ -298,18 +409,16 @@ export default function VideoPlayer({
 
                 onFileReady?.(processedFile, url, { preTranscode: false });
 
-                if (roomMode === 'native') {
-                    onNativePlayRequest?.(file.path || processedFile, {
-                        fileName: processedFile.name,
-                        startTime: 0,
-                    });
+                // Offer to save to library if the file was transcoded/remuxed
+                if (wasProcessed && isHost) {
+                    setShowSaveOffer({ blob: processedFile, fileName: processedFile.name });
                 }
             } catch (err) {
                 setError(`Failed to load movie: ${err.message}`);
                 setIsLoading(false);
             }
         },
-        [socket, onFileReady, roomCode, roomMode, onNativePlayRequest]
+        [socket, onFileReady, roomCode]
     );
 
     const handleSubtitleFile = useCallback(
@@ -454,6 +563,35 @@ export default function VideoPlayer({
                         onChange={(e) => handleFileSelect(e.target.files[0])}
                         style={{ display: 'none' }}
                     />
+
+                    {/* Movie Library */}
+                    {libraryMovies.length > 0 && (
+                        <div className="player__library" style={{ marginTop: 16, width: '100%', maxWidth: 400 }}>
+                            <h4 style={{ margin: '0 0 8px', opacity: 0.7, fontSize: 13 }}>My Library</h4>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                {libraryMovies.map((m) => (
+                                    <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 8, background: 'rgba(255,255,255,0.05)', borderRadius: 6, padding: '6px 10px' }}>
+                                        <button
+                                            className="player__browse-btn"
+                                            style={{ flex: 1, textAlign: 'left', fontSize: 12, padding: '4px 8px' }}
+                                            onClick={() => handleLoadFromLibrary(m)}
+                                            title={`${m.fileName} (${formatSize(m.fileSize)})`}
+                                        >
+                                            {m.fileName.length > 35 ? m.fileName.slice(0, 32) + '…' : m.fileName}
+                                            <span style={{ opacity: 0.5, marginLeft: 6 }}>{formatSize(m.fileSize)}</span>
+                                        </button>
+                                        <button
+                                            style={{ background: 'none', border: 'none', color: 'inherit', cursor: 'pointer', opacity: 0.4, fontSize: 14, padding: '2px 6px' }}
+                                            onClick={() => handleRemoveFromLibrary(m)}
+                                            title="Remove from library"
+                                        >
+                                            ✕
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
                 </div>
                 {error && <div className="player__error">{error}</div>}
             </div>
@@ -537,6 +675,25 @@ export default function VideoPlayer({
 
             {error && <div className="player__error">{error}</div>}
             {playbackNotice && <div className="player__error">{playbackNotice}</div>}
+
+            {/* Save to Library offer */}
+            {showSaveOffer && (
+                <div className="player__error" style={{ display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'center' }}>
+                    <span>Save to library for next time?</span>
+                    <button className="player__browse-btn" style={{ padding: '3px 10px', fontSize: 12 }} onClick={() => handleSaveToLibrary(showSaveOffer)}>
+                        Save
+                    </button>
+                    <button className="player__browse-btn" style={{ padding: '3px 10px', fontSize: 12, opacity: 0.6 }} onClick={handleDismissSaveOffer}>
+                        No thanks
+                    </button>
+                </div>
+            )}
+
+            {savedToLibNotice && (
+                <div className="player__error" style={{ background: 'rgba(34,197,94,0.15)' }}>
+                    {savedToLibNotice}
+                </div>
+            )}
         </div>
     );
 }

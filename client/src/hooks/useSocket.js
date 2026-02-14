@@ -25,10 +25,10 @@ const PARTICIPANT_ID_KEY = 'lovestream.participantId';
 
 function getClientCapabilities() {
     try {
-        const hasNativeVlcBridge = Boolean(window?.electron?.nativeVlc)
-            && typeof window.electron.nativeVlc.isAvailable === 'function';
+        const hasNativeTranscoderBridge = Boolean(window?.electron?.nativeTranscoder)
+            && typeof window.electron.nativeTranscoder.isAvailable === 'function';
         return {
-            nativePlayback: hasNativeVlcBridge,
+            nativePlayback: hasNativeTranscoderBridge,
         };
     } catch {
         return { nativePlayback: false };

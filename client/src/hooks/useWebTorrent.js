@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import WebTorrent from 'webtorrent';
 import renderMedia from 'render-media';
 import { getTempMedia, saveTempMedia, updateTempMediaPosition, TEMP_MEDIA_TTL_MS } from '../utils/tempMediaCache.js';
+import { findMovie, loadMovie } from '../utils/movieLibrary.js';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
@@ -25,6 +26,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
     const [isReceiving, setIsReceiving] = useState(false);
     const [movieBlobUrl, setMovieBlobUrl] = useState(null);
     const [movieFileName, setMovieFileName] = useState('');
+    const [completedDownload, setCompletedDownload] = useState(null); // {blob, fileName}
 
     const clientRef = useRef(null);
     const torrentRef = useRef(null);
@@ -283,7 +285,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         const sock = socket?.current;
         if (!sock) return;
 
-        const handleMagnet = (payload) => {
+        const handleMagnet = async (payload) => {
             const client = clientRef.current;
             if (!client) return;
 
@@ -300,6 +302,32 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
 
             console.log('[webtorrent] received magnet URI:', magnetURI, 'preTranscode:', isPreTranscode, 'name:', sharedName);
 
+            // Check movie library before downloading
+            if (!isPreTranscode && sharedName) {
+                try {
+                    const libEntry = await findMovie(sharedName);
+                    if (libEntry) {
+                        const cached = await loadMovie(libEntry.key);
+                        if (cached?.blob) {
+                            console.log('[webtorrent] found in library, skipping download:', sharedName);
+                            const url = URL.createObjectURL(cached.blob);
+                            setMovieBlobUrl(url);
+                            setMovieFileName(cached.fileName);
+                            setDownloadProgress(100);
+                            setIsReceiving(false);
+                            hasSentStreamReadyRef.current = true;
+                            socket?.current?.emit('viewer-stream-ready', {
+                                progress: 100,
+                                timestamp: Date.now(),
+                            });
+                            return;
+                        }
+                    }
+                } catch (err) {
+                    console.warn('[webtorrent] library check failed:', err);
+                }
+            }
+
             // Remove any existing torrent
             if (torrentRef.current) {
                 client.remove(torrentRef.current);
@@ -313,6 +341,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
             setIsReceiving(true);
             setDownloadProgress(0);
             setMovieBlobUrl(null);
+            setCompletedDownload(null);
             renderMediaReadyRef.current = false;
             hasSentStreamReadyRef.current = false;
 
@@ -352,7 +381,8 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                                 if (err) {
                                     console.error('[webtorrent] renderMedia error:', err.message);
                                     renderMediaReadyRef.current = false;
-                                    createBlobUrlFallback(videoFile);
+                                    // Don't create blob fallback here — file is still downloading.
+                                    // Blob will be created when download completes (torrent 'done' event).
                                 } else {
                                     renderMediaReadyRef.current = true;
                                     console.log('[webtorrent] streaming to video element via render-media');
@@ -361,12 +391,12 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                         } catch (renderErr) {
                             console.error('[webtorrent] render call failed:', renderErr);
                             renderMediaReadyRef.current = false;
-                            createBlobUrlFallback(videoFile);
+                            // Don't create blob fallback — wait for download to complete.
                         }
                     }
                 }
 
-                torrent.on('done', () => {
+                torrent.on('done', async () => {
                     if (token !== currentTorrentTokenRef.current) return;
 
                     console.log('[webtorrent] download complete!');
@@ -379,13 +409,23 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
                             name: videoFile?.name || sharedName || torrent.name,
                         });
 
-                        // Persist local playable source for post-download stability.
+                        // Create stable blob URL now that the full file is available.
                         createBlobUrlFallback(videoFile);
-                    }
 
-                    // Create blob fallback only if render-media never became ready.
-                    if (videoFile && !isPreTranscode && !renderMediaReadyRef.current) {
-                        createBlobUrlFallback(videoFile);
+                        // Expose for save-to-library prompt
+                        if (videoFile) {
+                            try {
+                                const buf = await videoFile.arrayBuffer();
+                                const lower = (videoFile.name || '').toLowerCase();
+                                const mime = lower.endsWith('.webm') ? 'video/webm'
+                                    : lower.endsWith('.mov') ? 'video/quicktime'
+                                    : 'video/mp4';
+                                const blob = new Blob([buf], { type: mime });
+                                setCompletedDownload({ blob, fileName: videoFile.name || sharedName || torrent.name });
+                            } catch (e) {
+                                console.warn('[webtorrent] failed to prepare library save data:', e);
+                            }
+                        }
                     }
                 });
 
@@ -438,5 +478,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         numPeers,
         isSending,
         isReceiving,
+        completedDownload,
+        clearCompletedDownload: () => setCompletedDownload(null),
     };
 }
