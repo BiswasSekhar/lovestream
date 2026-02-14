@@ -11,11 +11,21 @@ import VideoCall from '../components/Room/VideoCall.jsx';
 import Chat from '../components/Room/Chat.jsx';
 import Subtitles from '../components/Room/Subtitles.jsx';
 
+const roomRoleKey = (code) => `lovestream.role.${code}`;
+
 function RoomContent() {
     const { roomCode } = useParams();
     const location = useLocation();
     const navigate = useNavigate();
-    const role = location.state?.role || 'viewer';
+    const [role, setRole] = useState(() => {
+        const fromNav = location.state?.role;
+        if (fromNav) return fromNav;
+        try {
+            return localStorage.getItem(roomRoleKey(roomCode)) || 'viewer';
+        } catch {
+            return 'viewer';
+        }
+    });
     const isHost = role === 'host';
 
     const { state, dispatch } = useRoom();
@@ -35,6 +45,16 @@ function RoomContent() {
     const [subtitleCues, setSubtitleCues] = useState([]);
     const [currentTime, setCurrentTime] = useState(0);
     const [viewerPlayableReady, setViewerPlayableReady] = useState(false);
+    const [downloadCompleteToast, setDownloadCompleteToast] = useState('');
+    const [partnerDisconnected, setPartnerDisconnected] = useState(false);
+    const [allowSoloPlayback, setAllowSoloPlayback] = useState(false);
+    const autoStartedRef = useRef(false);
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(roomRoleKey(roomCode), role);
+        } catch { }
+    }, [roomCode, role]);
 
     // WebRTC (video call only — no movie stream)
     const {
@@ -84,6 +104,7 @@ function RoomContent() {
     // File streaming via WebTorrent (P2P)
     const {
         seedFile,
+        resetTransferState,
         movieBlobUrl,
         downloadProgress,
         transferSpeed,
@@ -104,6 +125,11 @@ function RoomContent() {
             dispatch({ type: 'SET_CURRENT_TIME', time });
             if (type === 'play') dispatch({ type: 'SET_PLAYING', isPlaying: true });
             if (type === 'pause') dispatch({ type: 'SET_PLAYING', isPlaying: false });
+
+            // If host receives a remote play event, treat partner as ready.
+            if (isHost && type === 'play') {
+                setViewerPlayableReady(true);
+            }
         },
     });
 
@@ -111,6 +137,10 @@ function RoomContent() {
     useEffect(() => {
         dispatch({ type: 'SET_ROOM', roomCode, role });
     }, [roomCode, role, dispatch]);
+
+    useEffect(() => {
+        dispatch({ type: 'SET_ROLE', role });
+    }, [dispatch, role]);
 
     const [mediaReady, setMediaReady] = useState(false);
 
@@ -122,28 +152,51 @@ function RoomContent() {
         return () => stopMedia();
     }, []);
 
-    // Signal readiness for WebRTC connection
+    // Join/rejoin room and signal readiness for WebRTC connection
     useEffect(() => {
         const sock = socket.current;
         if (!sock || !isConnected || !mediaReady) return;
 
-        // If viewer, also re-join the room socket room (for reconnection)
-        if (!isHost) {
-            sock.emit('join-room', { code: roomCode }, (response) => {
-                if (!response.success) {
-                    console.error('[room] failed to join:', response.error);
-                    return;
-                }
-                // Now signal we're ready for WebRTC
-                console.log('[room] viewer ready, emitting ready-for-connection');
-                sock.emit('ready-for-connection');
-            });
-        } else {
-            // Host is already in the room, just signal readiness
-            console.log('[room] host ready, emitting ready-for-connection');
+        sock.emit('join-room', { code: roomCode }, (response) => {
+            if (!response.success) {
+                console.error('[room] failed to join:', response.error);
+                return;
+            }
+
+            const serverRole = response?.room?.role;
+            if (serverRole === 'host' || serverRole === 'viewer') {
+                setRole(serverRole);
+            }
+
+            console.log('[room] joined/rejoined, emitting ready-for-connection');
             sock.emit('ready-for-connection');
-        }
-    }, [isConnected, isHost, roomCode, socket, mediaReady]);
+        });
+    }, [isConnected, roomCode, socket, mediaReady]);
+
+    useEffect(() => {
+        const sock = socket.current;
+        if (!sock) return;
+
+        const handlePeerLeft = ({ temporary }) => {
+            setPartnerDisconnected(true);
+            setViewerPlayableReady(false);
+            autoStartedRef.current = false;
+
+            // Pause local playback when partner disconnects.
+            const v = activeVideoRef.current;
+            if (v && !v.paused) {
+                v.pause();
+            }
+
+            if (isHost) {
+                setDownloadCompleteToast(temporary ? 'Partner disconnected. Playback paused.' : 'Partner left. Playback paused.');
+                setTimeout(() => setDownloadCompleteToast(''), 2500);
+            }
+        };
+
+        sock.on('peer-left', handlePeerLeft);
+        return () => sock.off('peer-left', handlePeerLeft);
+    }, [socket, activeVideoRef, isHost]);
 
     // Listen for subtitle data from host
     useEffect(() => {
@@ -176,15 +229,37 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock) return;
 
-        const handleViewerPlayable = ({ timestamp }) => {
+        const handleViewerStreamReady = ({ progress, timestamp }) => {
             if (!isHost) return;
+
+            setPartnerDisconnected(false);
             setViewerPlayableReady(true);
-            console.log('[room] viewer can play now (ack):', timestamp);
+            console.log('[room] viewer stream-ready ack:', progress, timestamp);
+
+            if (!autoStartedRef.current && hostVideoRef.current) {
+                autoStartedRef.current = true;
+                const startAt = hostVideoRef.current.currentTime || 0;
+                hostVideoRef.current.play().catch(() => { });
+                playbackSync.emitPlay(startAt);
+            }
         };
 
-        sock.on('viewer-playable', handleViewerPlayable);
-        return () => sock.off('viewer-playable', handleViewerPlayable);
-    }, [socket, isHost]);
+        sock.on('viewer-stream-ready', handleViewerStreamReady);
+        return () => sock.off('viewer-stream-ready', handleViewerStreamReady);
+    }, [socket, isHost, playbackSync]);
+
+    useEffect(() => {
+        const sock = socket.current;
+        if (!sock) return;
+
+        const handleDownloadComplete = ({ name }) => {
+            setDownloadCompleteToast(`✅ Download complete: ${name}`);
+            setTimeout(() => setDownloadCompleteToast(''), 3000);
+        };
+
+        sock.on('torrent-download-complete', handleDownloadComplete);
+        return () => sock.off('torrent-download-complete', handleDownloadComplete);
+    }, [socket]);
 
     // Track current time for subtitles
     const handleTimeUpdate = useCallback(
@@ -204,6 +279,9 @@ function RoomContent() {
             // Reset on first (pre) seed phase so host cannot start too early.
             if (isHost) {
                 setViewerPlayableReady(false);
+                setPartnerDisconnected(false);
+                setAllowSoloPlayback(false);
+                autoStartedRef.current = false;
             }
 
             // Keep reconnection source as finalized file only.
@@ -261,9 +339,11 @@ function RoomContent() {
     }, [dispatch, state.chatOpen]);
 
     const handleLeave = useCallback(() => {
+        socket.current?.emit('leave-room');
+        resetTransferState();
         stopMedia();
         navigate('/');
-    }, [navigate, stopMedia]);
+    }, [navigate, stopMedia, socket, resetTransferState]);
 
     const copyRoomLink = useCallback(() => {
         const url = `${window.location.origin}/room/${roomCode}`;
@@ -272,6 +352,49 @@ function RoomContent() {
 
     return (
         <div className={`room ${state.chatOpen ? 'room--chat-open' : ''}`}>
+            {downloadCompleteToast && (
+                <div style={{
+                    position: 'fixed',
+                    top: 16,
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    background: 'rgba(20,20,35,0.95)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: 10,
+                    padding: '10px 14px',
+                    zIndex: 3000,
+                    fontSize: 13,
+                }}>
+                    {downloadCompleteToast}
+                </div>
+            )}
+
+            {isHost && partnerDisconnected && (
+                <div style={{
+                    position: 'fixed',
+                    top: 56,
+                    left: '50%',
+                    transform: 'translateX(-50%)',
+                    background: 'rgba(20,20,35,0.95)',
+                    border: '1px solid rgba(255,255,255,0.12)',
+                    borderRadius: 10,
+                    padding: '10px 14px',
+                    zIndex: 3000,
+                    fontSize: 13,
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'center',
+                }}>
+                    <span>Partner disconnected. Playback paused.</span>
+                    <button
+                        className="landing__btn landing__btn--join"
+                        style={{ padding: '6px 10px', fontSize: 12 }}
+                        onClick={() => setAllowSoloPlayback((v) => !v)}
+                    >
+                        {allowSoloPlayback ? 'Disable Solo Play' : 'Play Anyway'}
+                    </button>
+                </div>
+            )}
             {/* Top bar */}
             <header className="room__header">
                 <div className="room__header-left">
@@ -324,6 +447,7 @@ function RoomContent() {
                     <VideoPlayer
                         isHost={isHost}
                         peerPlayableReady={!isHost || viewerPlayableReady}
+                        allowHostSoloPlayback={allowSoloPlayback}
                         videoRef={isHost ? hostVideoRef : viewerVideoRef}
                         movieBlobUrl={movieBlobUrl}
                         downloadProgress={downloadProgress}

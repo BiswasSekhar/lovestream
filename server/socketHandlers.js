@@ -179,12 +179,13 @@ export default function registerSocketHandlers(io, roomManager) {
             }
         });
 
-        // ─── Viewer playback readiness ───────────────────────
-        socket.on('viewer-buffer-ready', ({ progress }) => {
+        // ─── Viewer stream readiness ─────────────────────────
+        socket.on('viewer-stream-ready', ({ progress, timestamp }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
-                socket.to(room.code).emit('viewer-buffer-ready', {
+                socket.to(room.code).emit('viewer-stream-ready', {
                     progress: typeof progress === 'number' ? progress : 0,
+                    timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
                     from: socket.id,
                 });
             }
@@ -196,6 +197,16 @@ export default function registerSocketHandlers(io, roomManager) {
                 socket.to(room.code).emit('viewer-playable', {
                     timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
                     from: socket.id,
+                });
+            }
+        });
+
+        socket.on('torrent-download-complete', ({ name }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                io.in(room.code).emit('torrent-download-complete', {
+                    name: name || 'Movie',
+                    timestamp: Date.now(),
                 });
             }
         });
@@ -221,6 +232,21 @@ export default function registerSocketHandlers(io, roomManager) {
                     preTranscode: Boolean(preTranscode),
                     name: name || '',
                 });
+            }
+        });
+
+        // ─── Explicit Leave ────────────────────────────────────
+        socket.on('leave-room', () => {
+            readySockets.delete(socket.id);
+            const result = roomManager.leaveRoom(socket.id);
+            if (result) {
+                const { role, peerSocketId } = result;
+                if (peerSocketId) {
+                    io.to(peerSocketId).emit('peer-left', {
+                        role,
+                        temporary: false,
+                    });
+                }
             }
         });
 

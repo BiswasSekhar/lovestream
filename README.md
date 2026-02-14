@@ -50,31 +50,54 @@ This starts both the frontend (http://localhost:5173) and the signaling server (
 4. Open the link in a second browser tab
 5. The host can now select a movie file and start streaming!
 
+### Instant Share (No Deployment Needed!)
+
+Want to use this *right now* without deploying to a server? We have a magic script for that!
+
+**For Windows Users:**
+1. Clone the repo
+2. Run the all-in-one development script:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File dev.ps1
+   ```
+3. This script will:
+   - Start the backend server
+   - Start the frontend client
+   - **Create public Cloudflare tunnels** for both! 🤯
+4. Look for the **"OTHER LAPTOP"** link in the terminal output. Send that link to your partner, and you're good to go!
+
+---
+
 ## Deployment
 
-### Frontend → Vercel
+### 1. Backend (The Signal Tower)
+*The backend is just a small signaling server. It doesn't handle video traffic.*
 
-1. Push to GitHub
-2. Import in [vercel.com](https://vercel.com)
-3. Set env var: `VITE_SERVER_URL` = your Render backend URL
-4. Deploy
+**Deploy to Render.com (Free Tier):**
+1. Create a new **Web Service** connected to your repo.
+2. Root Directory: `server`
+3. Build Command: `npm install`
+4. Start Command: `npm start`
+5. **Environment Variables:**
+   - `CLIENT_URL`: The URL of your frontend (e.g., `https://my-lovestream.vercel.app`)
+   - `PORT`: `3001`
+   - *(Optional) TURN config if needed*
 
-### Backend → Render
+### 2. Frontend (The Theater)
+**Deploy to Vercel (Free Tier):**
+1. Import your repo into Vercel.
+2. Root Directory: `client`
+3. Build Command: `npm run build`
+4. **Environment Variables:**
+   - `VITE_SERVER_URL`: The URL of your Render backend (e.g., `https://my-lovestream-api.onrender.com`)
 
-1. Create a new **Web Service** on [render.com](https://render.com)
-2. Point it to the `server/` directory
-3. Build command: `npm install`
-4. Start command: `npm start`
-5. Set env vars:
-   - `CLIENT_URL` = your Vercel frontend URL
-   - `PORT` = 3001
-
-### TURN Server (Optional)
-
-For users behind strict NATs (mobile networks), add a TURN server:
-
-1. Sign up at [metered.ca](https://metered.ca) (free tier: 500MB/month)
-2. Set `TURN_URL`, `TURN_USERNAME`, `TURN_CREDENTIAL` env vars on the backend
+### 3. Connection Issues? (Optional TURN Server)
+If you can't connect (likely due to strict firewalls or mobile data), you need a TURN server.
+1. Sign up for a free account at [Metered.ca](https://metered.ca) (500MB free is plenty for signaling).
+2. Add these env vars to your **Backend (Render)**:
+   - `TURN_URL`: `turn:global.turn.metered.ca:80`
+   - `TURN_USERNAME`: `your_metered_username`
+   - `TURN_CREDENTIAL`: `your_metered_password`
 
 ## Keyboard Shortcuts
 

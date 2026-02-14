@@ -1,7 +1,26 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { io } from 'socket.io-client';
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+function resolveServerUrl() {
+    const envUrl = import.meta.env.VITE_SERVER_URL;
+
+    if (typeof window !== 'undefined') {
+        const origin = window.location.origin;
+        const isTunnel = (value) => typeof value === 'string' && value.includes('trycloudflare.com');
+
+        // In tunnel-based dev, tunnel URLs rotate often. Prefer the active page origin
+        // so /socket.io can flow through the same tunnel/proxy.
+        if (isTunnel(origin) && isTunnel(envUrl) && envUrl !== origin) {
+            return origin;
+        }
+
+        if (!envUrl) return origin;
+    }
+
+    return envUrl || 'http://localhost:3001';
+}
+
+const SERVER_URL = resolveServerUrl();
 const PARTICIPANT_ID_KEY = 'lovestream.participantId';
 
 function getOrCreateParticipantId() {
@@ -23,7 +42,9 @@ let sharedSocket = null;
 function getSocket() {
     if (!sharedSocket) {
         sharedSocket = io(SERVER_URL, {
-            transports: ['websocket', 'polling'],
+            path: '/socket.io',
+            transports: ['polling', 'websocket'],
+            upgrade: true,
             reconnection: true,
             reconnectionAttempts: Infinity,
             reconnectionDelay: 1000,
@@ -36,7 +57,7 @@ function getSocket() {
             console.log('[socket] disconnected:', reason);
         });
         sharedSocket.on('connect_error', (err) => {
-            console.error('[socket] connection error:', err.message);
+            console.error('[socket] connection error:', err.message, 'url:', SERVER_URL);
         });
     }
     return sharedSocket;

@@ -7,6 +7,7 @@ import Controls from './Controls.jsx';
 export default function VideoPlayer({
     isHost,
     peerPlayableReady = true,
+    allowHostSoloPlayback = false,
     videoRef,
     movieBlobUrl,
     downloadProgress,
@@ -29,7 +30,6 @@ export default function VideoPlayer({
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
     const selectedFileRef = useRef(null);
-    const viewerPlayableAckSentRef = useRef(false);
     const pendingHostStartRef = useRef(false);
 
     const handleFileSelect = useCallback(
@@ -181,7 +181,7 @@ export default function VideoPlayer({
         const video = videoRef.current;
         if (!video) return;
 
-        if (isHost && !peerPlayableReady) {
+        if (isHost && !peerPlayableReady && !allowHostSoloPlayback) {
             pendingHostStartRef.current = true;
             setPlaybackNotice('Waiting for your partner player to become ready...');
             video.pause();
@@ -191,7 +191,7 @@ export default function VideoPlayer({
         setPlaybackNotice('');
         pendingHostStartRef.current = false;
         playbackSync?.emitPlay(video.currentTime);
-    }, [videoRef, playbackSync, isHost, peerPlayableReady]);
+    }, [videoRef, playbackSync, isHost, peerPlayableReady, allowHostSoloPlayback]);
 
     const handlePause = useCallback(() => {
         const video = videoRef.current;
@@ -214,20 +214,9 @@ export default function VideoPlayer({
         }
     }, [isHost, peerPlayableReady, videoRef]);
 
-    useEffect(() => {
-        if (!isHost) {
-            viewerPlayableAckSentRef.current = false;
-        }
-    }, [isHost, movieBlobUrl]);
-
     const handleCanPlay = useCallback(() => {
         console.log('[player] can play');
-
-        if (!isHost && !viewerPlayableAckSentRef.current) {
-            viewerPlayableAckSentRef.current = true;
-            socket.current?.emit('viewer-playable', { timestamp: Date.now() });
-        }
-    }, [isHost, socket]);
+    }, []);
 
     if (isHost && !localMovieUrl && !isLoading) {
         return (

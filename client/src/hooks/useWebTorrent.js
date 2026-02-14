@@ -30,6 +30,8 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
     const progressIntervalRef = useRef(null);
     const renderMediaReadyRef = useRef(false);
     const currentTorrentTokenRef = useRef(0);
+    const hasSentStreamReadyRef = useRef(false);
+    const activeMagnetRef = useRef(null);
 
     // Get tracker URL from server URL
     const trackerUrl = SERVER_URL.replace(/^http/, 'ws') + '/';
@@ -109,6 +111,27 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
         }
     }, []);
 
+    const resetTransferState = useCallback(() => {
+        const client = clientRef.current;
+        if (client && torrentRef.current) {
+            try {
+                client.remove(torrentRef.current);
+            } catch { }
+            torrentRef.current = null;
+        }
+
+        activeMagnetRef.current = null;
+        currentTorrentTokenRef.current += 1;
+        stopProgressUpdates();
+        setIsReceiving(false);
+        setDownloadProgress(0);
+        setTransferSpeed(0);
+        setNumPeers(0);
+        setMovieFileName('');
+        renderMediaReadyRef.current = false;
+        hasSentStreamReadyRef.current = false;
+    }, [stopProgressUpdates]);
+
     // Host: seed a file
     const seedFile = useCallback((file, options = {}) => {
         const client = clientRef.current;
@@ -169,6 +192,12 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
             const sharedName = payload?.name || '';
             if (!magnetURI) return;
 
+            // Ignore duplicate finalized magnet replays to avoid restarting/losing current progress.
+            if (!isPreTranscode && activeMagnetRef.current === magnetURI && torrentRef.current) {
+                console.log('[webtorrent] duplicate finalized magnet ignored');
+                return;
+            }
+
             console.log('[webtorrent] received magnet URI:', magnetURI, 'preTranscode:', isPreTranscode, 'name:', sharedName);
 
             // Remove any existing torrent
@@ -179,11 +208,13 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
 
             currentTorrentTokenRef.current += 1;
             const token = currentTorrentTokenRef.current;
+            activeMagnetRef.current = magnetURI;
 
             setIsReceiving(true);
             setDownloadProgress(0);
             setMovieBlobUrl(null);
             renderMediaReadyRef.current = false;
+            hasSentStreamReadyRef.current = false;
 
             client.add(magnetURI, {
                 announce: [trackerUrl],
@@ -243,6 +274,12 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
                     setIsReceiving(false);
                     stopProgressUpdates();
 
+                    if (!isPreTranscode) {
+                        socket?.current?.emit('torrent-download-complete', {
+                            name: videoFile?.name || sharedName || torrent.name,
+                        });
+                    }
+
                     // Create blob fallback only if render-media never became ready.
                     if (videoFile && !isPreTranscode && !renderMediaReadyRef.current) {
                         createBlobUrlFallback(videoFile);
@@ -259,6 +296,26 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
                     console.error('[webtorrent] torrent error:', err?.message || err);
                 });
 
+                torrent.on('download', () => {
+                    if (token !== currentTorrentTokenRef.current) return;
+                    if (isPreTranscode || hasSentStreamReadyRef.current) return;
+
+                    const progressPercent = Math.round((torrent.progress || 0) * 100);
+                    if (progressPercent >= 5) {
+                        hasSentStreamReadyRef.current = true;
+                        console.log('[webtorrent] stream-ready at 5%:', progressPercent + '%');
+
+                        socket?.current?.emit('viewer-stream-ready', {
+                            progress: progressPercent,
+                            timestamp: Date.now(),
+                        });
+
+                        if (videoRef?.current) {
+                            videoRef.current.play().catch(() => { });
+                        }
+                    }
+                });
+
             });
         };
 
@@ -270,6 +327,7 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
 
     return {
         seedFile,
+        resetTransferState,
         movieBlobUrl,
         movieFileName,
         downloadProgress,
