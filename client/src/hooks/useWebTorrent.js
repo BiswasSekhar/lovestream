@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import WebTorrent from 'webtorrent';
 import renderMedia from 'render-media';
+import { getTempMedia, saveTempMedia, updateTempMediaPosition, TEMP_MEDIA_TTL_MS } from '../utils/tempMediaCache.js';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
@@ -16,7 +17,7 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
  * @param {boolean} params.isHost
  * @param {React.RefObject} params.videoRef - Reference to the <video> element
  */
-export default function useWebTorrent({ socket, isHost, videoRef }) {
+export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
     const [downloadProgress, setDownloadProgress] = useState(0);
     const [transferSpeed, setTransferSpeed] = useState(0); // bytes/sec
     const [numPeers, setNumPeers] = useState(0);
@@ -32,6 +33,7 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
     const currentTorrentTokenRef = useRef(0);
     const hasSentStreamReadyRef = useRef(false);
     const activeMagnetRef = useRef(null);
+    const lastPersistedPositionRef = useRef(0);
 
     // Get tracker URL from server URL
     const trackerUrl = SERVER_URL.replace(/^http/, 'ws') + '/';
@@ -73,6 +75,32 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
         if (!videoFile) return;
 
         try {
+            let blob = null;
+
+            if (typeof videoFile.arrayBuffer === 'function') {
+                const buffer = await videoFile.arrayBuffer();
+                const lower = (videoFile.name || '').toLowerCase();
+                const mime = lower.endsWith('.webm')
+                    ? 'video/webm'
+                    : lower.endsWith('.mov')
+                        ? 'video/quicktime'
+                        : 'video/mp4';
+                blob = new Blob([buffer], { type: mime });
+                const url = URL.createObjectURL(blob);
+                setMovieBlobUrl(url);
+
+                if (!isHost && roomCode) {
+                    await saveTempMedia({
+                        roomCode,
+                        role: 'viewer',
+                        blob,
+                        fileName: videoFile.name || 'movie.mp4',
+                        ttlMs: TEMP_MEDIA_TTL_MS,
+                    });
+                }
+                return;
+            }
+
             if (typeof videoFile.getBlobURL === 'function') {
                 videoFile.getBlobURL((err, url) => {
                     if (err) {
@@ -84,25 +112,11 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
                 return;
             }
 
-            if (typeof videoFile.arrayBuffer === 'function') {
-                const buffer = await videoFile.arrayBuffer();
-                const lower = (videoFile.name || '').toLowerCase();
-                const mime = lower.endsWith('.webm')
-                    ? 'video/webm'
-                    : lower.endsWith('.mov')
-                        ? 'video/quicktime'
-                        : 'video/mp4';
-                const blob = new Blob([buffer], { type: mime });
-                const url = URL.createObjectURL(blob);
-                setMovieBlobUrl(url);
-                return;
-            }
-
             console.warn('[webtorrent] No compatible blob fallback API on torrent file');
         } catch (err) {
             console.error('[webtorrent] blob fallback failed:', err);
         }
-    }, []);
+    }, [isHost, roomCode]);
 
     const stopProgressUpdates = useCallback(() => {
         if (progressIntervalRef.current) {
@@ -130,7 +144,57 @@ export default function useWebTorrent({ socket, isHost, videoRef }) {
         setMovieFileName('');
         renderMediaReadyRef.current = false;
         hasSentStreamReadyRef.current = false;
+        lastPersistedPositionRef.current = 0;
     }, [stopProgressUpdates]);
+
+    useEffect(() => {
+        if (isHost || !roomCode) return;
+        let cancelled = false;
+
+        getTempMedia({ roomCode, role: 'viewer' })
+            .then((cached) => {
+                if (cancelled || !cached?.blob) return;
+                const url = URL.createObjectURL(cached.blob);
+                setMovieBlobUrl(url);
+                setMovieFileName(cached.fileName || 'movie.mp4');
+                setDownloadProgress(100);
+                setIsReceiving(false);
+                hasSentStreamReadyRef.current = true;
+
+                const resumeAt = Number(cached.lastPosition || 0);
+                const video = videoRef?.current;
+                if (video && resumeAt > 0) {
+                    const applyResume = () => {
+                        video.currentTime = resumeAt;
+                        video.removeEventListener('loadedmetadata', applyResume);
+                    };
+                    video.addEventListener('loadedmetadata', applyResume);
+                }
+            })
+            .catch((err) => {
+                console.error('[webtorrent] failed to restore cached viewer media:', err);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [isHost, roomCode]);
+
+    useEffect(() => {
+        if (isHost || !roomCode) return;
+        const video = videoRef?.current;
+        if (!video) return;
+
+        const persistPosition = () => {
+            const current = Number(video.currentTime || 0);
+            if (Math.abs(current - lastPersistedPositionRef.current) < 2) return;
+            lastPersistedPositionRef.current = current;
+            updateTempMediaPosition({ roomCode, role: 'viewer', position: current }).catch(() => { });
+        };
+
+        video.addEventListener('timeupdate', persistPosition);
+        return () => video.removeEventListener('timeupdate', persistPosition);
+    }, [isHost, roomCode, videoRef]);
 
     // Host: seed a file
     const seedFile = useCallback((file, options = {}) => {

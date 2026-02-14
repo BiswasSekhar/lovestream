@@ -13,7 +13,7 @@ import Subtitles from '../components/Room/Subtitles.jsx';
 
 const roomRoleKey = (code) => `lovestream.role.${code}`;
 const roomRoleMetaKey = (code) => `lovestream.role.meta.${code}`;
-const DEFAULT_RECONNECT_GRACE_MS = 2 * 60 * 1000;
+const DEFAULT_RECONNECT_GRACE_MS = 24 * 60 * 60 * 1000;
 
 function getStoredRoomRole(code) {
     try {
@@ -141,6 +141,7 @@ function RoomContent() {
     } = useWebTorrent({
         socket,
         isHost,
+        roomCode,
         videoRef: isHost ? hostVideoRef : viewerVideoRef,
     });
 
@@ -229,9 +230,6 @@ function RoomContent() {
             setViewerPlayableReady(false);
             autoStartedRef.current = false;
 
-            // Stop/clear transfer state so next rejoin starts cleanly.
-            resetTransferState();
-
             // Pause local playback when partner disconnects.
             const v = activeVideoRef.current;
             if (v && !v.paused) {
@@ -246,7 +244,7 @@ function RoomContent() {
 
         sock.on('peer-left', handlePeerLeft);
         return () => sock.off('peer-left', handlePeerLeft);
-    }, [socket, activeVideoRef, isHost, resetTransferState]);
+    }, [socket, activeVideoRef, isHost]);
 
     // Listen for subtitle data from host
     useEffect(() => {
@@ -271,9 +269,31 @@ function RoomContent() {
             dispatch({ type: 'SET_MOVIE', name, duration });
         };
 
+        const handlePlaybackSnapshot = ({ playback }) => {
+            if (!playback || typeof playback.time !== 'number') return;
+            const video = activeVideoRef.current;
+            if (!video) return;
+
+            const time = Math.max(0, playback.time || 0);
+            video.currentTime = time;
+            dispatch({ type: 'SET_CURRENT_TIME', time });
+
+            if (playback.type === 'play') {
+                video.play().catch(() => { });
+                dispatch({ type: 'SET_PLAYING', isPlaying: true });
+            } else {
+                video.pause();
+                dispatch({ type: 'SET_PLAYING', isPlaying: false });
+            }
+        };
+
         sock.on('movie-loaded', handleMovieLoaded);
-        return () => sock.off('movie-loaded', handleMovieLoaded);
-    }, [socket, dispatch]);
+        sock.on('playback-snapshot', handlePlaybackSnapshot);
+        return () => {
+            sock.off('movie-loaded', handleMovieLoaded);
+            sock.off('playback-snapshot', handlePlaybackSnapshot);
+        };
+    }, [socket, dispatch, activeVideoRef]);
 
     useEffect(() => {
         const sock = socket.current;
@@ -498,6 +518,7 @@ function RoomContent() {
             <div className="room__body">
                 <div className="room__player-area">
                     <VideoPlayer
+                        roomCode={roomCode}
                         isHost={isHost}
                         peerPlayableReady={!isHost || viewerPlayableReady}
                         allowHostSoloPlayback={allowSoloPlayback}

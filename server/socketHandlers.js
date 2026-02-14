@@ -1,7 +1,7 @@
 export default function registerSocketHandlers(io, roomManager) {
     // Track which sockets are ready for WebRTC
     const readySockets = new Set();
-    const RECONNECT_GRACE_MS = 2 * 60 * 1000;
+    const RECONNECT_GRACE_MS = 24 * 60 * 60 * 1000;
 
     setInterval(() => {
         roomManager.cleanupExpired(RECONNECT_GRACE_MS);
@@ -62,6 +62,9 @@ export default function registerSocketHandlers(io, roomManager) {
             }
             if (snapshot?.magnet) {
                 io.to(socket.id).emit('torrent-magnet', snapshot.magnet);
+            }
+            if (snapshot?.playback) {
+                io.to(socket.id).emit('playback-snapshot', { playback: snapshot.playback });
             }
         });
 

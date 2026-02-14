@@ -2,9 +2,11 @@ import { useState, useRef, useCallback, useEffect } from 'react';
 import { needsTransmux, transmuxToFMP4 } from '../../utils/mkvHandler.js';
 import { fragmentMP4, isNativeMP4, probeMP4 } from '../../utils/mp4Fragmenter.js';
 import { parseSubtitles } from '../../utils/subtitleParser.js';
+import { getTempMedia, removeTempMedia, saveTempMedia, TEMP_MEDIA_TTL_MS } from '../../utils/tempMediaCache.js';
 import Controls from './Controls.jsx';
 
 export default function VideoPlayer({
+    roomCode,
     isHost,
     peerPlayableReady = true,
     allowHostSoloPlayback = false,
@@ -26,11 +28,62 @@ export default function VideoPlayer({
     const [error, setError] = useState('');
     const [isDragging, setIsDragging] = useState(false);
     const [playbackNotice, setPlaybackNotice] = useState('');
+    const [cachedPrompt, setCachedPrompt] = useState(null);
 
     const fileInputRef = useRef(null);
     const subtitleInputRef = useRef(null);
     const selectedFileRef = useRef(null);
     const pendingHostStartRef = useRef(false);
+    const checkedCachePromptRef = useRef(false);
+
+    const restoreHostCachedMedia = useCallback(async (cached) => {
+        if (!cached?.blob) return;
+
+        try {
+            const restoredFile = new File([cached.blob], cached.fileName || 'movie.mp4', {
+                type: cached.mimeType || cached.blob.type || 'video/mp4',
+            });
+
+            const url = URL.createObjectURL(restoredFile);
+            setLocalMovieUrl(url);
+            selectedFileRef.current = restoredFile;
+
+            socket.current?.emit('movie-loaded', {
+                name: restoredFile.name,
+                duration: 0,
+            });
+
+            onFileReady?.(restoredFile, url, { preTranscode: false, restored: true });
+        } catch (err) {
+            console.error('[player] failed to restore cached host media:', err);
+        }
+    }, [socket, onFileReady]);
+
+    const discardHostCachedMedia = useCallback(async () => {
+        if (!roomCode) return;
+        try {
+            await removeTempMedia({ roomCode, role: 'host' });
+        } catch (err) {
+            console.error('[player] failed to clear cached host media:', err);
+        } finally {
+            setCachedPrompt(null);
+        }
+    }, [roomCode]);
+
+    useEffect(() => {
+        if (!isHost || !roomCode || localMovieUrl || isLoading) return;
+        if (checkedCachePromptRef.current) return;
+
+        checkedCachePromptRef.current = true;
+        getTempMedia({ roomCode, role: 'host' })
+            .then((cached) => {
+                if (!cached?.blob) return;
+                setCachedPrompt(cached);
+            })
+            .catch((err) => {
+                console.error('[player] failed to check cached host media:', err);
+            });
+    }, [isHost, roomCode, localMovieUrl, isLoading]);
 
     const handleFileSelect = useCallback(
         async (file) => {
@@ -103,6 +156,14 @@ export default function VideoPlayer({
                 selectedFileRef.current = processedFile;
                 setIsLoading(false);
 
+                await saveTempMedia({
+                    roomCode,
+                    role: 'host',
+                    blob: processedFile,
+                    fileName: processedFile.name,
+                    ttlMs: TEMP_MEDIA_TTL_MS,
+                });
+
                 socket.current?.emit('movie-loaded', {
                     name: file.name,
                     duration: 0,
@@ -114,7 +175,7 @@ export default function VideoPlayer({
                 setIsLoading(false);
             }
         },
-        [socket, onFileReady]
+        [socket, onFileReady, roomCode]
     );
 
     const handleSubtitleFile = useCallback(
@@ -227,6 +288,21 @@ export default function VideoPlayer({
                 onDrop={handleDrop}
             >
                 <div className="player__dropzone-content">
+                        {cachedPrompt && (
+                            <div className="player__error" style={{ marginBottom: 12, textAlign: 'left' }}>
+                                <div style={{ marginBottom: 8 }}>
+                                    Resume cached movie: <strong>{cachedPrompt.fileName || 'movie.mp4'}</strong>
+                                </div>
+                                <div style={{ display: 'flex', gap: 8 }}>
+                                    <button className="player__browse-btn" onClick={() => restoreHostCachedMedia(cachedPrompt)}>
+                                        Resume
+                                    </button>
+                                    <button className="player__browse-btn" onClick={discardHostCachedMedia}>
+                                        Start Fresh
+                                    </button>
+                                </div>
+                            </div>
+                        )}
                     <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.6">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
                         <polyline points="17 8 12 3 7 8" />
