@@ -18,7 +18,7 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
  * @param {boolean} params.isHost
  * @param {React.RefObject} params.videoRef - Reference to the <video> element
  */
-export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
+export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disableViewerTorrent = false }) {
     const [downloadProgress, setDownloadProgress] = useState(0);
     const [transferSpeed, setTransferSpeed] = useState(0); // bytes/sec
     const [numPeers, setNumPeers] = useState(0);
@@ -164,6 +164,11 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
     }, [stopProgressUpdates]);
 
     useEffect(() => {
+        if (isHost || !disableViewerTorrent) return;
+        resetTransferState();
+    }, [isHost, disableViewerTorrent, resetTransferState]);
+
+    useEffect(() => {
         if (isHost || !roomCode) return;
         let cancelled = false;
 
@@ -290,6 +295,10 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         if (!sock) return;
 
         const handleMagnet = async (payload) => {
+            if (disableViewerTorrent) {
+                return;
+            }
+
             const client = clientRef.current;
             if (!client) return;
 
@@ -497,7 +506,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode }) {
         return () => {
             sock.off('torrent-magnet', handleMagnet);
         };
-    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates, createBlobUrlFallback]);
+    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates, createBlobUrlFallback, disableViewerTorrent]);
 
     return {
         seedFile,

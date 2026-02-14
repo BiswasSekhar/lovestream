@@ -256,14 +256,12 @@ export default function Controls({ videoRef, isHost, playbackSync, onSubtitleFil
 
                     {/* Right controls */}
                     <div className="controls__right">
-                        {isHost && (
-                            <button className="controls__btn" onClick={onSubtitleFile} title="Load subtitles">
-                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                                    <rect x="2" y="6" width="20" height="12" rx="2" />
-                                    <path d="M7 12h4M13 12h4M7 15h10" />
-                                </svg>
-                            </button>
-                        )}
+                        <button className="controls__btn" onClick={onSubtitleFile} title="Load subtitles">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                <rect x="2" y="6" width="20" height="12" rx="2" />
+                                <path d="M7 12h4M13 12h4M7 15h10" />
+                            </svg>
+                        </button>
 
                         <button className="controls__btn" onClick={toggleFullscreen} title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
                             {isFullscreen ? (

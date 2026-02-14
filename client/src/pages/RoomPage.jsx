@@ -77,6 +77,8 @@ function RoomContent() {
     const [partnerDisconnected, setPartnerDisconnected] = useState(false);
     const [allowSoloPlayback, setAllowSoloPlayback] = useState(false);
     const [roomMode, setRoomMode] = useState('web-compatible');
+    const [usingLocalPlayback, setUsingLocalPlayback] = useState(false);
+    const [peerUsingLocalPlayback, setPeerUsingLocalPlayback] = useState(false);
     const autoStartedRef = useRef(false);
 
     useEffect(() => {
@@ -115,7 +117,7 @@ function RoomContent() {
                 }
 
                 // 3. Reseed file (if selected)
-                if (currentFileRef.current) {
+                if (currentFileRef.current && !peerUsingLocalPlayback) {
                     console.log('[room] peer connected, re-seeding current file');
                     seedFile(currentFileRef.current);
                 }
@@ -145,6 +147,7 @@ function RoomContent() {
         isHost,
         roomCode,
         videoRef: isHost ? hostVideoRef : viewerVideoRef,
+        disableViewerTorrent: !isHost && usingLocalPlayback,
     });
 
     // Playback sync
@@ -254,13 +257,14 @@ function RoomContent() {
         if (!sock) return;
 
         const handleSubtitleData = ({ subtitles, filename }) => {
+            if (!isHost && usingLocalPlayback) return;
             setSubtitleCues(subtitles);
             dispatch({ type: 'SET_SUBTITLES', subtitles, filename });
         };
 
         sock.on('subtitle-data', handleSubtitleData);
         return () => sock.off('subtitle-data', handleSubtitleData);
-    }, [socket, dispatch]);
+    }, [socket, dispatch, isHost, usingLocalPlayback]);
 
     // Listen for movie metadata
     useEffect(() => {
@@ -324,6 +328,26 @@ function RoomContent() {
         const sock = socket.current;
         if (!sock) return;
 
+        const handleViewerLocalPlayback = ({ enabled }) => {
+            if (!isHost) return;
+            const localEnabled = Boolean(enabled);
+            setPeerUsingLocalPlayback(localEnabled);
+
+            if (localEnabled) {
+                resetTransferState();
+                setDownloadCompleteToast('Partner switched to local copy. P2P transfer stopped.');
+                setTimeout(() => setDownloadCompleteToast(''), 2500);
+            }
+        };
+
+        sock.on('viewer-local-playback', handleViewerLocalPlayback);
+        return () => sock.off('viewer-local-playback', handleViewerLocalPlayback);
+    }, [socket, isHost, resetTransferState]);
+
+    useEffect(() => {
+        const sock = socket.current;
+        if (!sock) return;
+
         const handleDownloadComplete = ({ name }) => {
             setDownloadCompleteToast(`✅ Download complete: ${name}`);
             setTimeout(() => setDownloadCompleteToast(''), 3000);
@@ -353,6 +377,7 @@ function RoomContent() {
                 setViewerPlayableReady(false);
                 setPartnerDisconnected(false);
                 setAllowSoloPlayback(false);
+                setPeerUsingLocalPlayback(false);
                 autoStartedRef.current = false;
             }
 
@@ -371,14 +396,26 @@ function RoomContent() {
 
     // Handle subtitles loaded by host
     const handleSubtitlesLoaded = useCallback(
-        (cues, filename) => {
+        (cues, filename, options = {}) => {
             setSubtitleCues(cues);
             dispatch({ type: 'SET_SUBTITLES', subtitles: cues, filename });
-            // Send to peer via socket
-            socket.current?.emit('subtitle-data', { subtitles: cues, filename });
+            if (!options.localOnly) {
+                socket.current?.emit('subtitle-data', { subtitles: cues, filename });
+            }
         },
         [dispatch, socket]
     );
+
+    const handleLocalPlaybackToggle = useCallback((enabled) => {
+        const localEnabled = Boolean(enabled);
+        setUsingLocalPlayback(localEnabled);
+        if (!isHost) {
+            socket.current?.emit('viewer-local-playback', {
+                enabled: localEnabled,
+                timestamp: Date.now(),
+            });
+        }
+    }, [isHost, socket]);
 
     // Chat
     const [chatUnread, setChatUnread] = useState(0);
@@ -534,6 +571,8 @@ function RoomContent() {
                         isSending={isSending}
                         isReceiving={isReceiving}
                         resetTransferState={resetTransferState}
+                        usingLocalPlayback={usingLocalPlayback}
+                        onLocalPlaybackToggle={handleLocalPlaybackToggle}
                         onFileReady={handleFileReady}
                         onTimeUpdate={handleTimeUpdate}
                         onSubtitlesLoaded={handleSubtitlesLoaded}

@@ -12,23 +12,35 @@ export default function VideoCall({
     const localVideoRef = useRef(null);
     const remoteVideoRef = useRef(null);
     const [position, setPosition] = useState({ x: 16, y: 16 });
+    const [size, setSize] = useState(180);
     const [isDragging, setIsDragging] = useState(false);
     const [minimized, setMinimized] = useState(false);
     const dragOffset = useRef({ x: 0, y: 0 });
 
-    // Set local video stream
-    useEffect(() => {
-        if (localVideoRef.current && localStream) {
-            localVideoRef.current.srcObject = localStream;
-        }
-    }, [localStream]);
+    const attachStream = useCallback((videoEl, stream, muted = false) => {
+        if (!videoEl) return;
+        videoEl.muted = muted;
 
-    // Set remote video stream
-    useEffect(() => {
-        if (remoteVideoRef.current && remoteStream) {
-            remoteVideoRef.current.srcObject = remoteStream;
+        if (videoEl.srcObject !== stream) {
+            videoEl.srcObject = stream || null;
         }
-    }, [remoteStream]);
+
+        if (stream) {
+            const playPromise = videoEl.play?.();
+            if (playPromise?.catch) {
+                playPromise.catch(() => { });
+            }
+        }
+    }, []);
+
+    // Keep streams attached even after minimize/expand toggles
+    useEffect(() => {
+        attachStream(localVideoRef.current, localStream, true);
+    }, [localStream, minimized, attachStream]);
+
+    useEffect(() => {
+        attachStream(remoteVideoRef.current, remoteStream, false);
+    }, [remoteStream, minimized, attachStream]);
 
     // Dragging
     const handleMouseDown = useCallback((e) => {
@@ -48,8 +60,9 @@ export default function VideoCall({
             const parent = document.querySelector('.room__player-area');
             if (!parent) return;
             const parentRect = parent.getBoundingClientRect();
-            const x = Math.max(0, Math.min(parentRect.width - 200, e.clientX - parentRect.left - dragOffset.current.x));
-            const y = Math.max(0, Math.min(parentRect.height - 160, e.clientY - parentRect.top - dragOffset.current.y));
+            const diameter = minimized ? 56 : size;
+            const x = Math.max(0, Math.min(parentRect.width - diameter, e.clientX - parentRect.left - dragOffset.current.x));
+            const y = Math.max(0, Math.min(parentRect.height - diameter, e.clientY - parentRect.top - dragOffset.current.y));
             setPosition({ x, y });
         };
 
@@ -61,31 +74,24 @@ export default function VideoCall({
             window.removeEventListener('mousemove', handleMouseMove);
             window.removeEventListener('mouseup', handleMouseUp);
         };
-    }, [isDragging]);
+    }, [isDragging, minimized, size]);
 
-    if (minimized) {
-        return (
-            <button
-                className="videocall__expand-btn"
-                onClick={() => setMinimized(false)}
-                title="Show video call"
-                style={{ position: 'absolute', bottom: 80, right: 16 }}
-            >
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                    <polygon points="23 7 16 12 23 17 23 7" />
-                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                </svg>
-            </button>
-        );
-    }
+    const decreaseSize = useCallback(() => {
+        setSize((prev) => Math.max(140, prev - 20));
+    }, []);
+
+    const increaseSize = useCallback(() => {
+        setSize((prev) => Math.min(320, prev + 20));
+    }, []);
+
+    const diameter = minimized ? 56 : size;
 
     return (
         <div
-            className="videocall"
-            style={{ left: position.x, top: position.y, zIndex: 100 }}
+            className={`videocall ${minimized ? 'videocall--minimized' : ''}`}
+            style={{ left: position.x, top: position.y, width: diameter, height: diameter, zIndex: 100 }}
             onMouseDown={handleMouseDown}
         >
-            {/* Remote video (larger) */}
             <div className="videocall__remote">
                 {remoteStream ? (
                     <video
@@ -104,7 +110,6 @@ export default function VideoCall({
                 )}
             </div>
 
-            {/* Local video (small PiP) */}
             <div className="videocall__local">
                 {localStream ? (
                     <video
@@ -121,7 +126,6 @@ export default function VideoCall({
                 )}
             </div>
 
-            {/* Controls */}
             <div className="videocall__controls">
                 <button
                     className={`videocall__btn ${!cameraOn ? 'videocall__btn--off' : ''}`}
@@ -161,6 +165,25 @@ export default function VideoCall({
                     )}
                 </button>
                 <button
+                    className="videocall__btn"
+                    onClick={decreaseSize}
+                    title="Decrease size"
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                </button>
+                <button
+                    className="videocall__btn"
+                    onClick={increaseSize}
+                    title="Increase size"
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                        <line x1="12" y1="5" x2="12" y2="19" />
+                        <line x1="5" y1="12" x2="19" y2="12" />
+                    </svg>
+                </button>
+                <button
                     className="videocall__btn videocall__btn--minimize"
                     onClick={() => setMinimized(true)}
                     title="Minimize"
@@ -170,6 +193,17 @@ export default function VideoCall({
                     </svg>
                 </button>
             </div>
+
+            <button
+                className="videocall__expand-btn"
+                onClick={() => setMinimized(false)}
+                title="Show video call"
+            >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polygon points="23 7 16 12 23 17 23 7" />
+                    <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                </svg>
+            </button>
         </div>
     );
 }

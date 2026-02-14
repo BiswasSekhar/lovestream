@@ -20,6 +20,8 @@ export default function VideoPlayer({
     isSending,
     isReceiving,
     resetTransferState,
+    usingLocalPlayback,
+    onLocalPlaybackToggle,
     onFileReady,
     onTimeUpdate,
     onSubtitlesLoaded,
@@ -151,11 +153,20 @@ export default function VideoPlayer({
         const url = URL.createObjectURL(file);
         setLocalMovieUrl(url);
         resetTransferState?.();
+        onLocalPlaybackToggle?.(true);
         socket.current?.emit('viewer-stream-ready', {
             progress: 100,
             timestamp: Date.now(),
         });
-    }, [isHost, resetTransferState, socket]);
+    }, [isHost, resetTransferState, socket, onLocalPlaybackToggle]);
+
+    useEffect(() => {
+        if (isHost) return;
+        if (localMovieUrl) return;
+        if (movieBlobUrl || isReceiving) {
+            onLocalPlaybackToggle?.(false);
+        }
+    }, [isHost, localMovieUrl, movieBlobUrl, isReceiving, onLocalPlaybackToggle]);
 
     // Load movie from library
     const handleLoadFromLibrary = useCallback(async (movie) => {
@@ -451,12 +462,13 @@ export default function VideoPlayer({
             try {
                 const text = await file.text();
                 const cues = parseSubtitles(text, file.name);
-                onSubtitlesLoaded?.(cues, file.name);
+                const localOnly = !isHost && usingLocalPlayback;
+                onSubtitlesLoaded?.(cues, file.name, { localOnly });
             } catch (err) {
                 setError(`Failed to load subtitles: ${err.message}`);
             }
         },
-        [onSubtitlesLoaded]
+        [onSubtitlesLoaded, isHost, usingLocalPlayback]
     );
 
     const handleDragOver = (e) => {
@@ -699,15 +711,13 @@ export default function VideoPlayer({
                 onSubtitleFile={() => subtitleInputRef.current?.click()}
             />
 
-            {isHost && (
-                <input
-                    ref={subtitleInputRef}
-                    type="file"
-                    accept=".srt,.ass,.ssa"
-                    onChange={(e) => handleSubtitleFile(e.target.files[0])}
-                    style={{ display: 'none' }}
-                />
-            )}
+            <input
+                ref={subtitleInputRef}
+                type="file"
+                accept=".srt,.ass,.ssa"
+                onChange={(e) => handleSubtitleFile(e.target.files[0])}
+                style={{ display: 'none' }}
+            />
 
             {(!isHost && isReceiving && !movieBlobUrl && !localMovieUrl) && (
                 <div className="player__download-bar">

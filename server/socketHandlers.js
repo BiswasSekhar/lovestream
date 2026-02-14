@@ -209,6 +209,17 @@ export default function registerSocketHandlers(io, roomManager) {
             }
         });
 
+        socket.on('viewer-local-playback', ({ enabled, timestamp }) => {
+            const room = roomManager.getRoomBySocket(socket.id);
+            if (room) {
+                socket.to(room.code).emit('viewer-local-playback', {
+                    enabled: Boolean(enabled),
+                    timestamp: typeof timestamp === 'number' ? timestamp : Date.now(),
+                    from: socket.id,
+                });
+            }
+        });
+
         socket.on('torrent-download-complete', ({ name }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {

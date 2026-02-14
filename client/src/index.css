@@ -1015,8 +1015,7 @@ a {
 .videocall {
   position: absolute;
   z-index: 5;
-  width: 200px;
-  border-radius: var(--radius-md);
+  border-radius: 9999px;
   overflow: hidden;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
@@ -1031,21 +1030,22 @@ a {
 
 .videocall__remote {
   width: 100%;
-  height: 130px;
+  height: 100%;
   background: var(--bg-tertiary);
   position: relative;
 }
 
 .videocall__local {
   position: absolute;
-  bottom: 40px;
-  right: 6px;
-  width: 64px;
-  height: 48px;
-  border-radius: var(--radius-sm);
+  bottom: 44px;
+  right: 10px;
+  width: 34%;
+  height: 34%;
+  border-radius: 9999px;
   overflow: hidden;
   border: 1px solid var(--border-color);
   background: var(--bg-elevated);
+  z-index: 2;
 }
 
 .videocall__video {
@@ -1072,21 +1072,29 @@ a {
 }
 
 .videocall__controls {
+  position: absolute;
+  left: 50%;
+  bottom: 8px;
+  transform: translateX(-50%);
   display: flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-xs);
-  padding: var(--space-xs);
-  background: var(--bg-secondary);
+  padding: 4px 8px;
+  background: var(--bg-glass);
+  backdrop-filter: blur(8px);
+  border: 1px solid var(--border-color);
+  border-radius: 9999px;
+  z-index: 3;
 }
 
 .videocall__btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: var(--radius-sm);
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
   color: var(--text-secondary);
   transition: all var(--transition-fast);
 }
@@ -1110,19 +1118,34 @@ a {
 }
 
 .videocall__expand-btn {
-  padding: 10px;
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
   background: var(--bg-glass);
   backdrop-filter: blur(10px);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
+  border: none;
+  border-radius: 9999px;
   color: var(--text-secondary);
   transition: all var(--transition-fast);
-  z-index: 5;
+  z-index: 4;
 }
 
 .videocall__expand-btn:hover {
   color: var(--text-primary);
   background: var(--bg-elevated);
+}
+
+.videocall--minimized .videocall__local,
+.videocall--minimized .videocall__controls {
+  display: none;
+}
+
+.videocall--minimized .videocall__expand-btn {
+  display: flex;
 }
 
 /* ══════════════════════════════════════════════════════════
@@ -1351,17 +1374,14 @@ a {
     background: var(--bg-primary);
   }
 
-  .videocall {
-    width: 140px;
+  .videocall__controls {
+    gap: 2px;
+    padding: 2px 6px;
   }
 
-  .videocall__remote {
-    height: 90px;
-  }
-
-  .videocall__local {
-    width: 48px;
-    height: 36px;
+  .videocall__btn {
+    width: 24px;
+    height: 24px;
   }
 
   .controls__volume-slider {
