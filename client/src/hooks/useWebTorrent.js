@@ -429,11 +429,18 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                     if (isPreTranscode) {
                         console.log('[webtorrent] pre-transcode prefetch phase; skipping player attach');
                     } else if (videoRef?.current) {
-                        /* ─── Stream path routing (the torrent streaming site approach) ─── */
+                        /* ─── Stream path routing ─── */
 
-                        if (streamPath === 'remux') {
-                            // MKV or non-native MP4: use on-the-fly remux via mp4box.js → MSE
-                            // This is what Stremio/Webtor do: fragment as pieces arrive
+                        if (window.electron?.streamServer) {
+                            // ═══ ELECTRON: progressive HTTP streaming for ANY format ═══
+                            // Write torrent data to temp file → serve via local HTTP server.
+                            // This is the Stremio approach: torrent → local HTTP → <video>.
+                            console.log('[webtorrent] ELECTRON path: will use local HTTP stream server');
+
+                            attachElectronStream(videoFile, torrent, token);
+
+                        } else if (streamPath === 'remux') {
+                            // ═══ BROWSER REMUX: mp4box.js → MSE (for MP4 that needs fragmentation) ═══
                             console.log('[webtorrent] REMUX path: piping torrent → mp4box.js → MSE');
 
                             const abortCtrl = new AbortController();
@@ -457,14 +464,11 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                             }).catch((err) => {
                                 if (err.name === 'AbortError' || token !== currentTorrentTokenRef.current) return;
                                 console.warn('[webtorrent] MSE remux failed, falling back to render-media:', err.message);
-
-                                // Fallback to render-media
                                 attachRenderMedia(videoFile, token);
                             });
 
                         } else {
-                            // 'direct' or 'transcode' (transcoded file is already MP4)
-                            // Use render-media for progressive MSE streaming (standard WebTorrent approach)
+                            // ═══ BROWSER DIRECT: render-media progressive MSE ═══
                             attachRenderMedia(videoFile, token);
                         }
                     }
@@ -536,6 +540,95 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                     }
                 });
 
+            });
+        };
+
+        /**
+         * Helper: Electron progressive playback via local HTTP stream server.
+         *
+         * Strategy: save the torrent file to a temp path on disk, then serve it
+         * via the local HTTP server with Range request support. The video element
+         * starts playing progressively as data is written to the file.
+         *
+         * For large files, we periodically re-save as more pieces arrive so the
+         * HTTP server can serve the latest data. The video player handles buffering
+         * naturally via HTTP range requests.
+         */
+        const attachElectronStream = async (videoFile, torrent, token) => {
+            if (!window.electron?.streamServer || !window.electron?.nativeTranscoder) return;
+            if (!videoRef?.current) return;
+
+            console.log('[webtorrent] Electron stream: saving torrent data to temp file for HTTP serving');
+
+            let streamId = null;
+            let tempPath = null;
+            let hasAttached = false;
+
+            const saveAndServe = async () => {
+                if (token !== currentTorrentTokenRef.current) return;
+
+                try {
+                    // Get the current data as a buffer
+                    const buf = await videoFile.arrayBuffer();
+                    const bytes = new Uint8Array(buf);
+
+                    if (bytes.length === 0) return;
+
+                    // Save to temp file (overwrite each time with latest data)
+                    const saveResult = await window.electron.nativeTranscoder.saveTempFile(
+                        bytes,
+                        videoFile.name || 'movie.mp4'
+                    );
+                    if (!saveResult?.success) {
+                        console.warn('[webtorrent] Electron stream: failed to save temp file:', saveResult?.error);
+                        return;
+                    }
+
+                    tempPath = saveResult.filePath;
+
+                    // Register with stream server (first time or re-register with new path)
+                    if (streamId !== null) {
+                        await window.electron.streamServer.unregister(streamId);
+                    }
+
+                    const regResult = await window.electron.streamServer.register(tempPath);
+                    if (!regResult?.success) {
+                        console.warn('[webtorrent] Electron stream: failed to register stream:', regResult?.error);
+                        return;
+                    }
+                    streamId = regResult.streamId;
+
+                    // Set video src only once — browser will re-request ranges as needed
+                    if (!hasAttached && videoRef.current) {
+                        hasAttached = true;
+                        renderMediaReadyRef.current = true;
+                        videoRef.current.src = regResult.url;
+                        setMovieBlobUrl(regResult.url);
+                        console.log('[webtorrent] Electron stream: attached HTTP URL:', regResult.url);
+                    }
+                } catch (err) {
+                    console.warn('[webtorrent] Electron stream error:', err.message);
+                }
+            };
+
+            // Save immediately with whatever data we have so far
+            await saveAndServe();
+
+            // Re-save periodically as more pieces arrive for progressive updates
+            const resaveInterval = setInterval(async () => {
+                if (token !== currentTorrentTokenRef.current) {
+                    clearInterval(resaveInterval);
+                    return;
+                }
+                await saveAndServe();
+            }, 3000); // Every 3 seconds
+
+            // Final save when download completes
+            torrent.on('done', async () => {
+                clearInterval(resaveInterval);
+                if (token !== currentTorrentTokenRef.current) return;
+                await saveAndServe();
+                console.log('[webtorrent] Electron stream: final save complete');
             });
         };
 

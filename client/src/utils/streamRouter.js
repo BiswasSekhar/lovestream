@@ -44,6 +44,12 @@ function getExtension(name) {
     return dot >= 0 ? name.slice(dot).toLowerCase() : '';
 }
 
+/* ───────── environment detection ───────── */
+
+export function isElectron() {
+    return Boolean(typeof window !== 'undefined' && window.electron);
+}
+
 /* ───────── main classifier ───────── */
 
 /**
@@ -51,12 +57,23 @@ function getExtension(name) {
  * This only looks at container / extension for the fast path.
  * For MP4 files it also probes codecs.
  *
+ * In Electron: always returns 'direct' because Electron can play
+ * any format via the local HTTP streaming server (no transcoding needed).
+ *
  * @param {File} file
  * @returns {Promise<{path: 'direct'|'remux'|'transcode', reason: string, probeResult?: object}>}
  */
 export async function classifyFile(file) {
     const ext = getExtension(file.name);
     const mimeType = file.type || '';
+
+    /* ─── Electron: everything is direct-playable ─── */
+    if (isElectron()) {
+        return {
+            path: 'direct',
+            reason: `Electron app — all formats playable via local HTTP streaming (${ext})`,
+        };
+    }
 
     /* ─── 1. Never-native containers → transcode ─── */
     if (NEVER_NATIVE.has(ext)) {

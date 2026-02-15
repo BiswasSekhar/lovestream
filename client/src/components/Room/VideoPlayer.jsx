@@ -299,23 +299,41 @@ export default function VideoPlayer({
 
                 /* ═══════════════════════════════════════════
                  *  PATH 1: DIRECT — Zero processing (instant!)
-                 *  This is what torrent streaming sites do for
-                 *  natively playable formats.
+                 *  In Electron: uses local HTTP streaming server for any format.
+                 *  In browser:  uses blob URL (only for natively playable formats).
                  * ═══════════════════════════════════════════ */
                 if (streamPath === 'direct') {
                     console.log('[player] ✅ DIRECT path — zero processing, instant seed');
-                    url = URL.createObjectURL(file);
+
+                    // In Electron with a real file path → use local HTTP streaming server
+                    // This enables progressive playback of MKV, HEVC, etc.
+                    if (window.electron?.streamServer && file.path) {
+                        try {
+                            const result = await window.electron.streamServer.register(file.path);
+                            if (result?.success && result.url) {
+                                console.log('[player] Using Electron stream server:', result.url);
+                                url = result.url;
+                            } else {
+                                url = URL.createObjectURL(file);
+                            }
+                        } catch (err) {
+                            console.warn('[player] Stream server failed, falling back to blob URL:', err.message);
+                            url = URL.createObjectURL(file);
+                        }
+                    } else {
+                        url = URL.createObjectURL(file);
+                    }
                     setLoadProgress(100);
                 }
 
                 /* ═══════════════════════════════════════════
-                 *  PATH 2: REMUX — Seed original, let viewer remux
-                 *  Host seeds the raw MKV/non-native container.
-                 *  Viewer uses mp4box.js → MSE for playback.
-                 *  Host still needs a playable URL for local preview.
+                 *  PATH 2: REMUX — Process first, then seed processed MP4
+                 *  MKV/non-native containers must be remuxed to MP4 before
+                 *  seeding because mp4box.js/render-media can't parse MKV.
+                 *  The viewer receives a standard MP4 via torrent (streamPath='direct').
                  * ═══════════════════════════════════════════ */
                 else if (streamPath === 'remux') {
-                    console.log('[player] 🔄 REMUX path — seed original file, process for local preview');
+                    console.log('[player] 🔄 REMUX path — process then seed processed MP4');
 
                     if (hasNativeTranscoder) {
                         /* Electron: native FFmpeg smart process */
@@ -386,6 +404,8 @@ export default function VideoPlayer({
 
                     setLoadingLabel('Processing movie...');
                     setLoadProgress(100);
+                    // Remuxed output is a standard MP4 — viewer can play it directly
+                    streamPath = 'direct';
                 }
 
                 /* ═══════════════════════════════════════════
@@ -451,10 +471,10 @@ export default function VideoPlayer({
                     duration: 0,
                 });
 
-                // For remux path: seed the ORIGINAL file (not the processed one)
-                // The viewer will handle remuxing on their end via mp4box.js → MSE
-                const fileToSeed = classification.path === 'remux' ? file : processedFile;
-                onFileReady?.(fileToSeed, url, { preTranscode: false, streamPath });
+                // Always seed the processed file — viewers need a browser-playable MP4.
+                // mp4box.js can NOT parse non-MP4 containers (MKV, AVI, etc.),
+                // so seeding the raw original for viewer-side remux doesn't work.
+                onFileReady?.(processedFile, url, { preTranscode: false, streamPath });
 
                 // Offer to save to library if the file was transcoded/remuxed
                 if (wasProcessed && isHost) {
