@@ -144,6 +144,7 @@ function RoomContent() {
         numPeers,
         isSending,
         isReceiving,
+        isProcessing,
         completedDownload,
         clearCompletedDownload,
     } = useWebTorrent({
@@ -664,6 +665,7 @@ function RoomContent() {
                         numPeers={numPeers}
                         isSending={isSending}
                         isReceiving={isReceiving}
+                        isProcessing={isProcessing}
                         resetTransferState={resetTransferState}
                         usingLocalPlayback={usingLocalPlayback}
                         onLocalPlaybackToggle={handleLocalPlaybackToggle}

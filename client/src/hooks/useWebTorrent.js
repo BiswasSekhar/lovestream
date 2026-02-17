@@ -4,6 +4,7 @@ import renderMedia from 'render-media';
 import { getTempMedia, saveTempMedia, updateTempMediaPosition, TEMP_MEDIA_TTL_MS } from '../utils/tempMediaCache.js';
 import { findMovie, loadMovie } from '../utils/movieLibrary.js';
 import { streamTorrentToMSE } from '../utils/mp4Fragmenter.js';
+import { transmuxToFMP4 } from '../utils/mkvHandler.js';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
@@ -12,14 +13,14 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
  *
  * New streaming architecture (modelled after Stremio / Webtor / torrent streaming sites):
  *
- *   Host: ALWAYS seeds the original file immediately — no waiting for transcode.
- *         Sends a `streamPath` alongside the magnet URI so the viewer knows
- *         which playback pipeline to use.
+ * Host: ALWAYS seeds the original file immediately — no waiting for transcode.
+ * Sends a `streamPath` alongside the magnet URI so the viewer knows
+ * which playback pipeline to use.
  *
- *   Viewer receives magnet + streamPath and picks the right strategy:
- *     - 'direct'    → render-media progressive MSE (works for MP4/WebM)
- *     - 'remux'     → mp4box.js on-the-fly fragmentation → MSE SourceBuffer
- *     - 'transcode' → waits for host's second (transcoded) magnet
+ * Viewer receives magnet + streamPath and picks the right strategy:
+ * - 'direct'    → render-media progressive MSE (works for MP4/WebM)
+ * - 'remux'     → download → ffmpeg.wasm remux → play (for MKV with H.264)
+ * - 'transcode' → download → ffmpeg.wasm transcode → play (for HEVC/AVI)
  *
  * @param {object} params
  * @param {React.MutableRefObject} params.socket - Socket.IO ref
@@ -32,6 +33,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
     const [numPeers, setNumPeers] = useState(0);
     const [isSending, setIsSending] = useState(false);
     const [isReceiving, setIsReceiving] = useState(false);
+    const [isProcessing, setIsProcessing] = useState(false); // ffmpeg.wasm remux/transcode in progress
     const [movieBlobUrl, setMovieBlobUrl] = useState(null);
     const [movieFileName, setMovieFileName] = useState('');
     const [completedDownload, setCompletedDownload] = useState(null); // {blob, fileName}
@@ -46,6 +48,8 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
     const lastPersistedPositionRef = useRef(0);
     const seededFileKeyRef = useRef('');
     const mseAbortRef = useRef(null); // AbortController for MSE stream
+    const electronStreamIdRef = useRef(null);
+    const electronJitStreamIdRef = useRef(null);
 
     const buildFileKey = useCallback((file) => {
         if (!file) return '';
@@ -76,6 +80,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         return () => {
             stopProgressUpdates();
             mseAbortRef.current?.abort();
+            cleanupElectronStream();
             if (clientRef.current) {
                 clientRef.current.destroy();
                 clientRef.current = null;
@@ -150,6 +155,20 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         }
     }, []);
 
+    const cleanupElectronStream = useCallback(() => {
+        const streamId = electronStreamIdRef.current;
+        if (streamId != null) {
+            electronStreamIdRef.current = null;
+            window.electron?.streamServer?.unregister?.(streamId).catch(() => { });
+        }
+
+        const jitStreamId = electronJitStreamIdRef.current;
+        if (jitStreamId != null) {
+            electronJitStreamIdRef.current = null;
+            window.electron?.jitStream?.destroy?.(jitStreamId).catch(() => { });
+        }
+    }, []);
+
     const resetTransferState = useCallback(() => {
         const client = clientRef.current;
         if (client && torrentRef.current) {
@@ -158,6 +177,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
             } catch { }
             torrentRef.current = null;
         }
+        cleanupElectronStream();
 
         // Abort any active MSE stream
         mseAbortRef.current?.abort();
@@ -176,7 +196,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         hasSentStreamReadyRef.current = false;
         lastPersistedPositionRef.current = 0;
         seededFileKeyRef.current = '';
-    }, [stopProgressUpdates]);
+    }, [stopProgressUpdates, cleanupElectronStream]);
 
     useEffect(() => {
         if (isHost || !disableViewerTorrent) return;
@@ -391,6 +411,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
             // Abort any previous MSE stream
             mseAbortRef.current?.abort();
             mseAbortRef.current = null;
+            cleanupElectronStream();
 
             currentTorrentTokenRef.current += 1;
             const token = currentTorrentTokenRef.current;
@@ -435,36 +456,131 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                             // ═══ ELECTRON: progressive HTTP streaming for ANY format ═══
                             // Write torrent data to temp file → serve via local HTTP server.
                             // This is the Stremio approach: torrent → local HTTP → <video>.
-                            console.log('[webtorrent] ELECTRON path: will use local HTTP stream server');
+                            if (streamPath === 'direct') {
+                                console.log('[webtorrent] ELECTRON direct path: local HTTP stream server');
+                                attachElectronStream(videoFile, torrent, token);
+                            } else {
+                                console.log(`[webtorrent] ELECTRON ${streamPath} path: torrent -> FFmpeg JIT -> localhost`);
+                                attachElectronJitStream(videoFile, token, streamPath);
+                            }
 
-                            attachElectronStream(videoFile, torrent, token);
+                        } else if (streamPath === 'remux' || streamPath === 'transcode') {
+                            // ═══ BROWSER TORRENT-TO-STREAM: download → ffmpeg.wasm → play ═══
+                            // The torrent contains the original MKV/non-native file.
+                            // We download it fully, then remux/transcode via ffmpeg.wasm.
+                            console.log(`[webtorrent] BROWSER ${streamPath.toUpperCase()} path: download → ffmpeg.wasm → play`);
+                            setIsProcessing(true);
 
-                        } else if (streamPath === 'remux') {
-                            // ═══ BROWSER REMUX: mp4box.js → MSE (for MP4 that needs fragmentation) ═══
-                            console.log('[webtorrent] REMUX path: piping torrent → mp4box.js → MSE');
-
-                            const abortCtrl = new AbortController();
-                            mseAbortRef.current = abortCtrl;
-
-                            streamTorrentToMSE(videoFile, videoRef.current, {
-                                signal: abortCtrl.signal,
-                                onProgress: (p) => {
-                                    if (token !== currentTorrentTokenRef.current) return;
-                                    setDownloadProgress(p);
-                                },
-                            }).then(({ mime }) => {
+                            // Wait for full download, then process
+                            torrent.on('done', async () => {
                                 if (token !== currentTorrentTokenRef.current) return;
-                                renderMediaReadyRef.current = true;
-                                console.log('[webtorrent] MSE remux streaming active, mime:', mime);
+                                console.log(`[webtorrent] torrent complete — starting ffmpeg.wasm ${streamPath}...`);
 
-                                const streamUrl = videoRef.current?.src;
-                                if (streamUrl) {
-                                    setMovieBlobUrl(streamUrl);
+                                try {
+                                    const buf = await videoFile.arrayBuffer();
+                                    const fileName = videoFile.name || 'movie.mkv';
+                                    const lower = fileName.toLowerCase();
+                                    const mime = lower.endsWith('.webm') ? 'video/webm'
+                                        : lower.endsWith('.mkv') ? 'video/x-matroska'
+                                            : lower.endsWith('.mov') ? 'video/quicktime'
+                                                : 'video/mp4';
+                                    const fileBlob = new File([buf], fileName, { type: mime });
+
+                                    const forceH264 = streamPath === 'transcode';
+                                    const result = await transmuxToFMP4(
+                                        fileBlob,
+                                        (p) => {
+                                            if (token !== currentTorrentTokenRef.current) return;
+                                            // Map 0-100 ffmpeg progress to UI
+                                            setDownloadProgress(Math.round(p));
+                                        },
+                                        forceH264 ? { forceH264: true } : undefined
+                                    );
+
+                                    if (token !== currentTorrentTokenRef.current) return;
+
+                                    // Handle case where remux output is still HEVC
+                                    if (!forceH264 && result.isHevc) {
+                                        const hevcOk = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                                        if (!hevcOk) {
+                                            console.log('[webtorrent] HEVC detected, re-processing with forceH264...');
+                                            const result2 = await transmuxToFMP4(
+                                                fileBlob,
+                                                (p) => {
+                                                    if (token !== currentTorrentTokenRef.current) return;
+                                                    setDownloadProgress(Math.round(p));
+                                                },
+                                                { forceH264: true }
+                                            );
+                                            if (token !== currentTorrentTokenRef.current) return;
+                                            URL.revokeObjectURL(result.url);
+                                            setMovieBlobUrl(result2.url);
+                                            renderMediaReadyRef.current = true;
+                                            setIsProcessing(false);
+                                            setIsReceiving(false);
+                                            setDownloadProgress(100);
+
+                                            if (!hasSentStreamReadyRef.current) {
+                                                hasSentStreamReadyRef.current = true;
+                                                socket?.current?.emit('viewer-stream-ready', {
+                                                    progress: 100,
+                                                    timestamp: Date.now(),
+                                                });
+                                            }
+
+                                            if (videoRef?.current) {
+                                                videoRef.current.src = result2.url;
+                                                videoRef.current.play().catch(() => { });
+                                            }
+                                            return;
+                                        }
+                                    }
+
+                                    setMovieBlobUrl(result.url);
+                                    renderMediaReadyRef.current = true;
+                                    setIsProcessing(false);
+                                    setIsReceiving(false);
+                                    setDownloadProgress(100);
+
+                                    if (!hasSentStreamReadyRef.current) {
+                                        hasSentStreamReadyRef.current = true;
+                                        socket?.current?.emit('viewer-stream-ready', {
+                                            progress: 100,
+                                            timestamp: Date.now(),
+                                        });
+                                    }
+
+                                    if (videoRef?.current) {
+                                        videoRef.current.src = result.url;
+                                        videoRef.current.play().catch(() => { });
+                                    }
+                                } catch (err) {
+                                    console.warn(`[webtorrent] ffmpeg.wasm ${streamPath} failed:`, err.message);
+                                    setIsProcessing(false);
+
+                                    // Fallback 1: try mp4box.js MSE (works if file is actually MP4)
+                                    if (streamPath === 'remux') {
+                                        console.log('[webtorrent] falling back to mp4box.js MSE...');
+                                        const abortCtrl = new AbortController();
+                                        mseAbortRef.current = abortCtrl;
+                                        try {
+                                            await streamTorrentToMSE(videoFile, videoRef.current, {
+                                                signal: abortCtrl.signal,
+                                                onProgress: (p) => {
+                                                    if (token !== currentTorrentTokenRef.current) return;
+                                                    setDownloadProgress(p);
+                                                },
+                                            });
+                                            renderMediaReadyRef.current = true;
+                                        } catch (mseErr) {
+                                            console.warn('[webtorrent] mp4box.js MSE also failed, trying render-media:', mseErr.message);
+                                            attachRenderMedia(videoFile, token);
+                                        }
+                                    } else {
+                                        // Fallback 2: render-media (last resort)
+                                        attachRenderMedia(videoFile, token);
+                                    }
                                 }
-                            }).catch((err) => {
-                                if (err.name === 'AbortError' || token !== currentTorrentTokenRef.current) return;
-                                console.warn('[webtorrent] MSE remux failed, falling back to render-media:', err.message);
-                                attachRenderMedia(videoFile, token);
                             });
 
                         } else {
@@ -560,9 +676,10 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
             console.log('[webtorrent] Electron stream: saving torrent data to temp file for HTTP serving');
 
-            let streamId = null;
+            let streamId = electronStreamIdRef.current;
             let tempPath = null;
             let hasAttached = false;
+            let streamUrl = null;
 
             const saveAndServe = async () => {
                 if (token !== currentTorrentTokenRef.current) return;
@@ -586,25 +703,32 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
                     tempPath = saveResult.filePath;
 
-                    // Register with stream server (first time or re-register with new path)
-                    if (streamId !== null) {
-                        await window.electron.streamServer.unregister(streamId);
+                    // Keep a stable stream id/url and update the backing file path.
+                    if (streamId == null) {
+                        const regResult = await window.electron.streamServer.register(tempPath);
+                        if (!regResult?.success) {
+                            console.warn('[webtorrent] Electron stream: failed to register stream:', regResult?.error);
+                            return;
+                        }
+                        streamId = regResult.streamId;
+                        electronStreamIdRef.current = streamId;
+                        streamUrl = regResult.url;
+                    } else {
+                        const updateResult = await window.electron.streamServer.update(streamId, tempPath);
+                        if (!updateResult?.success) {
+                            console.warn('[webtorrent] Electron stream: failed to update stream:', updateResult?.error);
+                            return;
+                        }
+                        streamUrl = updateResult.url;
                     }
-
-                    const regResult = await window.electron.streamServer.register(tempPath);
-                    if (!regResult?.success) {
-                        console.warn('[webtorrent] Electron stream: failed to register stream:', regResult?.error);
-                        return;
-                    }
-                    streamId = regResult.streamId;
 
                     // Set video src only once — browser will re-request ranges as needed
                     if (!hasAttached && videoRef.current) {
                         hasAttached = true;
                         renderMediaReadyRef.current = true;
-                        videoRef.current.src = regResult.url;
-                        setMovieBlobUrl(regResult.url);
-                        console.log('[webtorrent] Electron stream: attached HTTP URL:', regResult.url);
+                        videoRef.current.src = streamUrl;
+                        setMovieBlobUrl(streamUrl);
+                        console.log('[webtorrent] Electron stream: attached HTTP URL:', streamUrl);
                     }
                 } catch (err) {
                     console.warn('[webtorrent] Electron stream error:', err.message);
@@ -629,6 +753,90 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                 if (token !== currentTorrentTokenRef.current) return;
                 await saveAndServe();
                 console.log('[webtorrent] Electron stream: final save complete');
+            });
+        };
+
+        /**
+         * Helper: Electron JIT bridge for non-direct streams.
+         * Feeds torrent bytes into FFmpeg stdin and plays FFmpeg stdout via localhost HTTP.
+         */
+        const attachElectronJitStream = async (videoFile, token, streamPath) => {
+            if (!window.electron?.jitStream?.create || !videoRef?.current) return;
+
+            const mode = streamPath === 'transcode' ? 'transcode' : 'remux';
+            const createResult = await window.electron.jitStream.create(mode);
+            if (!createResult?.success || !createResult?.streamId || !createResult?.url) {
+                console.warn('[webtorrent] Failed to create Electron JIT stream:', createResult?.error);
+                return;
+            }
+
+            const jitId = createResult.streamId;
+            electronJitStreamIdRef.current = jitId;
+            renderMediaReadyRef.current = true;
+            videoRef.current.src = createResult.url;
+            setMovieBlobUrl(createResult.url);
+
+            const source = videoFile.createReadStream();
+            const queue = [];
+            let pumping = false;
+            let finished = false;
+
+            const endSession = async () => {
+                if (electronJitStreamIdRef.current === jitId) {
+                    electronJitStreamIdRef.current = null;
+                }
+                await window.electron.jitStream.destroy(jitId).catch(() => { });
+            };
+
+            const pump = async () => {
+                if (pumping) return;
+                pumping = true;
+                try {
+                    while (queue.length > 0) {
+                        if (token !== currentTorrentTokenRef.current) {
+                            source.destroy();
+                            await endSession();
+                            break;
+                        }
+
+                        const chunk = queue.shift();
+                        const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+                        const pushResult = await window.electron.jitStream.push(jitId, bytes);
+                        if (!pushResult?.success) {
+                            console.warn('[webtorrent] JIT push failed:', pushResult?.error);
+                            source.destroy();
+                            await endSession();
+                            break;
+                        }
+
+                        if (pushResult.backpressure) {
+                            await new Promise((resolve) => setTimeout(resolve, 10));
+                        }
+                    }
+                } finally {
+                    pumping = false;
+                }
+            };
+
+            source.on('data', (chunk) => {
+                if (token !== currentTorrentTokenRef.current) {
+                    source.destroy();
+                    return;
+                }
+                queue.push(chunk);
+                pump();
+            });
+
+            source.on('end', async () => {
+                if (finished) return;
+                finished = true;
+                await pump();
+                await window.electron.jitStream.end(jitId).catch(() => { });
+            });
+
+            source.on('error', async (err) => {
+                console.warn('[webtorrent] Electron JIT source error:', err?.message || err);
+                await endSession();
             });
         };
 
@@ -666,7 +874,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         return () => {
             sock.off('torrent-magnet', handleMagnet);
         };
-    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates, createBlobUrlFallback, disableViewerTorrent]);
+    }, [isHost, socket, trackerUrl, videoRef, startProgressUpdates, stopProgressUpdates, createBlobUrlFallback, disableViewerTorrent, cleanupElectronStream]);
 
     return {
         seedFile,
@@ -678,6 +886,7 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
         numPeers,
         isSending,
         isReceiving,
+        isProcessing,
         completedDownload,
         clearCompletedDownload: () => setCompletedDownload(null),
     };

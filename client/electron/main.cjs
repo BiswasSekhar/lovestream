@@ -102,6 +102,120 @@ let streamServer = null;
 let streamServerPort = null;
 let activeStreams = new Map(); // id -> { filePath, mimeType }
 let nextStreamId = 1;
+let jitStreams = new Map(); // id -> { child, clients, history, historyBytes, ended, stderrTail }
+let nextJitStreamId = 1;
+const JIT_HISTORY_MAX_BYTES = 2 * 1024 * 1024;
+
+function buildJitFfmpegArgs(mode = 'remux') {
+    const videoArgs = mode === 'transcode'
+        ? ['-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency', '-pix_fmt', 'yuv420p']
+        : ['-c:v', 'copy'];
+
+    return [
+        '-hide_banner',
+        '-loglevel', 'error',
+        '-fflags', '+genpts',
+        '-i', 'pipe:0',
+        '-map', '0:v:0?',
+        '-map', '0:a:0?',
+        ...videoArgs,
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-f', 'mp4',
+        'pipe:1',
+    ];
+}
+
+function spawnJitStreamSession(mode = 'remux') {
+    if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+        return { error: 'FFmpeg binary not found' };
+    }
+
+    const id = nextJitStreamId++;
+    const args = buildJitFfmpegArgs(mode);
+    const child = spawn(ffmpegPath, args, {
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    const session = {
+        id,
+        mode,
+        child,
+        clients: new Set(),
+        history: [],
+        historyBytes: 0,
+        ended: false,
+        stderrTail: '',
+    };
+
+    child.stdout.on('data', (chunk) => {
+        const buffer = Buffer.from(chunk);
+
+        if (session.historyBytes < JIT_HISTORY_MAX_BYTES) {
+            const remaining = JIT_HISTORY_MAX_BYTES - session.historyBytes;
+            const capped = buffer.length <= remaining ? buffer : buffer.subarray(0, remaining);
+            session.history.push(capped);
+            session.historyBytes += capped.length;
+        }
+
+        for (const res of session.clients) {
+            if (!res.writableEnded) {
+                try { res.write(buffer); } catch { }
+            }
+        }
+    });
+
+    child.stderr.on('data', (chunk) => {
+        session.stderrTail = (session.stderrTail + chunk.toString()).slice(-1200);
+    });
+
+    const handleExit = (code, signal) => {
+        session.ended = true;
+        for (const res of session.clients) {
+            if (!res.writableEnded) {
+                try { res.end(); } catch { }
+            }
+        }
+        session.clients.clear();
+        jitStreams.delete(id);
+
+        if (code !== 0) {
+            const detail = session.stderrTail ? ` | ${session.stderrTail}` : '';
+            console.warn(`[jit-stream] session ${id} exited code=${code} signal=${signal || 'none'}${detail}`);
+        }
+    };
+
+    child.on('error', (err) => {
+        session.stderrTail = (session.stderrTail + ` | spawn error: ${err?.message || err}`).slice(-1200);
+    });
+    child.on('close', handleExit);
+
+    jitStreams.set(id, session);
+    return { session };
+}
+
+function destroyJitStreamSession(streamId) {
+    const id = Number(streamId);
+    const session = jitStreams.get(id);
+    if (!session) return false;
+
+    session.ended = true;
+    for (const res of session.clients) {
+        if (!res.writableEnded) {
+            try { res.end(); } catch { }
+        }
+    }
+    session.clients.clear();
+    jitStreams.delete(id);
+
+    try { session.child.stdin.destroy(); } catch { }
+    try { session.child.stdout.destroy(); } catch { }
+    try { session.child.stderr.destroy(); } catch { }
+    try { session.child.kill('SIGKILL'); } catch { }
+    return true;
+}
 
 function getMimeType(filePath) {
     const ext = path.extname(filePath).toLowerCase();
@@ -134,6 +248,42 @@ function ensureStreamServer() {
             if (req.method === 'OPTIONS') {
                 res.writeHead(200);
                 res.end();
+                return;
+            }
+
+            // URL format: /jit/<id> (FFmpeg stdin->stdout live stream)
+            const jitMatch = req.url.match(/^\/jit\/(\d+)/);
+            if (jitMatch) {
+                const jitId = parseInt(jitMatch[1], 10);
+                const session = jitStreams.get(jitId);
+                if (!session) {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' });
+                    res.end('JIT stream not found');
+                    return;
+                }
+
+                res.writeHead(200, {
+                    'Content-Type': 'video/mp4',
+                    'Cache-Control': 'no-store, no-cache, must-revalidate',
+                    'Pragma': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'Accept-Ranges': 'none',
+                });
+
+                // Replay early initialization bytes (fMP4 headers/moov) for late attach.
+                for (const chunk of session.history) {
+                    try { res.write(chunk); } catch { }
+                }
+
+                session.clients.add(res);
+
+                req.on('close', () => {
+                    session.clients.delete(res);
+                });
+
+                if (session.ended && !res.writableEnded) {
+                    try { res.end(); } catch { }
+                }
                 return;
             }
 
@@ -225,9 +375,99 @@ function registerStreamServerIpc() {
         }
     });
 
+    // Update an existing stream entry to a new backing file path.
+    // This keeps the same /stream/<id> URL stable for the renderer.
+    ipcMain.handle('stream-server:update', async (_event, { streamId, filePath }) => {
+        try {
+            const id = Number(streamId);
+            if (!Number.isFinite(id) || !activeStreams.has(id)) {
+                return { success: false, error: 'Stream not found' };
+            }
+            if (!filePath || !fs.existsSync(filePath)) {
+                return { success: false, error: 'File not found' };
+            }
+
+            const existing = activeStreams.get(id);
+            activeStreams.set(id, {
+                ...existing,
+                filePath,
+                mimeType: getMimeType(filePath),
+            });
+
+            const port = await ensureStreamServer();
+            const url = `http://127.0.0.1:${port}/stream/${id}`;
+            return { success: true, url, streamId: id };
+        } catch (error) {
+            return { success: false, error: error?.message || String(error) };
+        }
+    });
+
     // Unregister a stream
     ipcMain.handle('stream-server:unregister', async (_event, { streamId }) => {
         activeStreams.delete(streamId);
+        return { success: true };
+    });
+}
+
+function registerJitStreamIpc() {
+    ipcMain.handle('jit-stream:create', async (_event, { mode } = {}) => {
+        try {
+            const normalizedMode = mode === 'transcode' ? 'transcode' : 'remux';
+            const port = await ensureStreamServer();
+            const created = spawnJitStreamSession(normalizedMode);
+            if (created.error || !created.session) {
+                return { success: false, error: created.error || 'Failed to create JIT stream session' };
+            }
+
+            const streamId = created.session.id;
+            const url = `http://127.0.0.1:${port}/jit/${streamId}`;
+            return { success: true, streamId, url, mode: normalizedMode };
+        } catch (error) {
+            return { success: false, error: error?.message || String(error) };
+        }
+    });
+
+    ipcMain.handle('jit-stream:push', async (_event, { streamId, bytes }) => {
+        const id = Number(streamId);
+        const session = jitStreams.get(id);
+        if (!session || session.ended) {
+            return { success: false, error: 'JIT stream session not found' };
+        }
+
+        try {
+            if (!session.child.stdin || session.child.stdin.destroyed || !session.child.stdin.writable) {
+                return { success: false, error: 'JIT stdin is not writable' };
+            }
+            const buffer = Buffer.from(bytes);
+            const ok = session.child.stdin.write(buffer);
+            return { success: true, backpressure: !ok };
+        } catch (error) {
+            return { success: false, error: error?.message || String(error) };
+        }
+    });
+
+    ipcMain.handle('jit-stream:end', async (_event, { streamId }) => {
+        const id = Number(streamId);
+        const session = jitStreams.get(id);
+        if (!session || session.ended) {
+            return { success: false, error: 'JIT stream session not found' };
+        }
+
+        try {
+            if (session.child.stdin && !session.child.stdin.destroyed) {
+                session.child.stdin.end();
+            }
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: error?.message || String(error) };
+        }
+    });
+
+    ipcMain.handle('jit-stream:destroy', async (_event, { streamId }) => {
+        const destroyed = destroyJitStreamSession(streamId);
+        if (!destroyed) {
+            return { success: false, error: 'JIT stream session not found' };
+        }
         return { success: true };
     });
 }
@@ -334,6 +574,7 @@ function createWindow() {
 app.whenReady().then(() => {
     registerNativeTranscoderIpc();
     registerStreamServerIpc();
+    registerJitStreamIpc();
     createWindow();
 
     app.on('activate', function () {
@@ -346,6 +587,9 @@ app.on('window-all-closed', function () {
 });
 
 app.on('before-quit', () => {
+    for (const streamId of Array.from(jitStreams.keys())) {
+        destroyJitStreamSession(streamId);
+    }
     // Clean up stream server
     if (streamServer) {
         try { streamServer.close(); } catch { }

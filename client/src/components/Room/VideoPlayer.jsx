@@ -10,6 +10,7 @@ import Controls from './Controls.jsx';
 export default function VideoPlayer({
     roomCode,
     isHost,
+    roomMode = 'web-compatible',
     movieName,
     peerPlayableReady = true,
     allowHostSoloPlayback = false,
@@ -20,6 +21,7 @@ export default function VideoPlayer({
     numPeers,
     isSending,
     isReceiving,
+    isProcessing,
     resetTransferState,
     usingLocalPlayback,
     onLocalPlaybackToggle,
@@ -164,10 +166,10 @@ export default function VideoPlayer({
     useEffect(() => {
         if (isHost) return;
         if (localMovieUrl) return;
-        if (movieBlobUrl || isReceiving) {
+        if (movieBlobUrl || isReceiving || isProcessing) {
             onLocalPlaybackToggle?.(false);
         }
-    }, [isHost, localMovieUrl, movieBlobUrl, isReceiving, onLocalPlaybackToggle]);
+    }, [isHost, localMovieUrl, movieBlobUrl, isReceiving, isProcessing, onLocalPlaybackToggle]);
 
     // Load movie from library
     const handleLoadFromLibrary = useCallback(async (movie) => {
@@ -227,9 +229,12 @@ export default function VideoPlayer({
 
             try {
                 const hasNativeTranscoder = Boolean(window?.electron?.nativeTranscoder?.processFile);
+                const hasStreamServer = Boolean(window?.electron?.streamServer?.register);
+                const isNativeRoom = roomMode === 'native';
+                const canUseNativeJitBridge = isNativeRoom && hasNativeTranscoder && hasStreamServer;
 
                 /* ─── Step 1: Classify the file ─── */
-                const classification = await classifyFile(file);
+                const classification = await classifyFile(file, { forceWeb: !isNativeRoom });
                 console.log('[player] File classification:', classification);
 
                 let url;
@@ -327,15 +332,32 @@ export default function VideoPlayer({
                 }
 
                 /* ═══════════════════════════════════════════
-                 *  PATH 2: REMUX — Process first, then seed processed MP4
-                 *  MKV/non-native containers must be remuxed to MP4 before
-                 *  seeding because mp4box.js/render-media can't parse MKV.
-                 *  The viewer receives a standard MP4 via torrent (streamPath='direct').
+                 *  PATH 2: REMUX — Seed original, process locally
+                 *  Electron / native-JIT: seed original, play via stream server.
+                 *  Browser: seed original IMMEDIATELY (viewer handles remux),
+                 *           then remux locally in background for host playback.
                  * ═══════════════════════════════════════════ */
                 else if (streamPath === 'remux') {
-                    console.log('[player] 🔄 REMUX path — process then seed processed MP4');
+                    console.log('[player] 🔄 REMUX path — seed original, process locally');
 
-                    if (hasNativeTranscoder) {
+                    if (canUseNativeJitBridge) {
+                        setLoadingLabel('Preparing on-the-fly stream...');
+                        if (window.electron?.streamServer && file.path) {
+                            try {
+                                const result = await window.electron.streamServer.register(file.path);
+                                if (result?.success && result.url) {
+                                    url = result.url;
+                                } else {
+                                    url = URL.createObjectURL(file);
+                                }
+                            } catch (err) {
+                                console.warn('[player] Stream server failed, falling back to blob URL:', err.message);
+                                url = URL.createObjectURL(file);
+                            }
+                        } else {
+                            url = URL.createObjectURL(file);
+                        }
+                    } else if (hasNativeTranscoder) {
                         /* Electron: native FFmpeg smart process */
                         setLoadingLabel('Remuxing to MP4 (fast)…');
                         setLoadProgress(10);
@@ -378,8 +400,19 @@ export default function VideoPlayer({
                             wasProcessed = true;
                         }
                     } else {
-                        /* Browser fallback: ffmpeg.wasm */
-                        setLoadingLabel('Remuxing to MP4 (browser)…');
+                        /* ═══ Browser: Torrent-to-Stream model ═══
+                         * Seed the ORIGINAL file immediately so the viewer
+                         * starts downloading right away. Remux locally in
+                         * the background for host playback only.
+                         */
+                        console.log('[player] 🔄 WEB REMUX: seeding original immediately, remuxing locally...');
+
+                        // 1. Seed original immediately — viewer handles their own remux
+                        socket.current?.emit('movie-loaded', { name: file.name, duration: 0 });
+                        onFileReady?.(file, null, { preTranscode: false, streamPath: 'remux' });
+
+                        // 2. Remux locally in background for host playback
+                        setLoadingLabel('Remuxing for local playback…');
                         setLoadProgress(5);
 
                         let result = await transmuxToFMP4(file, (p) => setLoadProgress(p));
@@ -395,17 +428,37 @@ export default function VideoPlayer({
                         }
 
                         url = result.url;
-                        const response = await fetch(url);
-                        const blob = await response.blob();
-                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
-                        processedFile = new File([blob], newName, { type: result.mime });
-                        wasProcessed = true;
+                        setLocalMovieUrl(url);
+                        selectedFileRef.current = file; // keep original for re-seeding
+                        setIsLoading(false);
+                        setLoadProgress(100);
+
+                        // Cache for reconnect
+                        try {
+                            await saveTempMedia({
+                                roomCode,
+                                role: 'host',
+                                blob: file,
+                                fileName: file.name,
+                                sourcePath: file.path || null,
+                                ttlMs: TEMP_MEDIA_TTL_MS,
+                            });
+                        } catch (cacheErr) {
+                            console.warn('[player] temp cache save skipped (quota?):', cacheErr.message);
+                        }
+
+                        // Already seeded + emitted movie-loaded above, so return early
+                        return;
                     }
 
-                    setLoadingLabel('Processing movie...');
-                    setLoadProgress(100);
-                    // Remuxed output is a standard MP4 — viewer can play it directly
-                    streamPath = 'direct';
+                    if (canUseNativeJitBridge) {
+                        setLoadProgress(100);
+                    } else {
+                        setLoadingLabel('Processing movie...');
+                        setLoadProgress(100);
+                        // Remuxed output is a standard MP4 — viewer can play it directly
+                        streamPath = 'direct';
+                    }
                 }
 
                 /* ═══════════════════════════════════════════
@@ -415,7 +468,24 @@ export default function VideoPlayer({
                 else if (streamPath === 'transcode') {
                     console.log('[player] ⚠️ TRANSCODE path —', classification.reason);
 
-                    if (hasNativeTranscoder) {
+                    if (canUseNativeJitBridge) {
+                        setLoadingLabel('Preparing on-the-fly stream...');
+                        if (window.electron?.streamServer && file.path) {
+                            try {
+                                const result = await window.electron.streamServer.register(file.path);
+                                if (result?.success && result.url) {
+                                    url = result.url;
+                                } else {
+                                    url = URL.createObjectURL(file);
+                                }
+                            } catch (err) {
+                                console.warn('[player] Stream server failed, falling back to blob URL:', err.message);
+                                url = URL.createObjectURL(file);
+                            }
+                        } else {
+                            url = URL.createObjectURL(file);
+                        }
+                    } else if (hasNativeTranscoder) {
                         setLoadingLabel('Transcoding to H.264 (native)…');
                         setLoadProgress(10);
 
@@ -432,21 +502,50 @@ export default function VideoPlayer({
                         wasProcessed = true;
                         streamPath = 'direct'; // transcoded file is now directly playable
                     } else {
-                        setError('This video uses HEVC/H.265 which your browser may not support. Try Chrome or Edge, or use the desktop app.');
-                        setLoadingLabel('Transcoding (browser)…');
+                        /* ═══ Browser: Torrent-to-Stream model ═══
+                         * Seed the ORIGINAL file immediately so the viewer
+                         * starts downloading right away. Transcode locally
+                         * for host playback (slow — warn user).
+                         */
+                        console.log('[player] ⚠️ WEB TRANSCODE: seeding original, transcoding locally...');
+                        setError('This video uses HEVC/H.265. Transcoding in browser — for best results use the desktop app.');
+
+                        // 1. Seed original immediately — viewer handles their own transcode
+                        socket.current?.emit('movie-loaded', { name: file.name, duration: 0 });
+                        onFileReady?.(file, null, { preTranscode: false, streamPath: 'transcode' });
+
+                        // 2. Transcode locally for host playback
+                        setLoadingLabel('Transcoding for local playback…');
                         setLoadProgress(10);
                         const result = await transmuxToFMP4(file, (p) => setLoadProgress(p), { forceH264: true });
                         url = result.url;
-                        const response = await fetch(url);
-                        const blob = await response.blob();
-                        const newName = file.name.replace(/\.[^/.]+$/, '') + '.mp4';
-                        processedFile = new File([blob], newName, { type: result.mime });
-                        wasProcessed = true;
-                        streamPath = 'direct'; // transcoded file is now directly playable
+                        setLocalMovieUrl(url);
+                        selectedFileRef.current = file;
+                        setIsLoading(false);
+                        setLoadProgress(100);
+
+                        try {
+                            await saveTempMedia({
+                                roomCode,
+                                role: 'host',
+                                blob: file,
+                                fileName: file.name,
+                                sourcePath: file.path || null,
+                                ttlMs: TEMP_MEDIA_TTL_MS,
+                            });
+                        } catch (cacheErr) {
+                            console.warn('[player] temp cache save skipped (quota?):', cacheErr.message);
+                        }
+
+                        return; // already seeded + emitted above
                     }
 
-                    setLoadingLabel('Processing movie...');
-                    setLoadProgress(100);
+                    if (canUseNativeJitBridge) {
+                        setLoadProgress(100);
+                    } else {
+                        setLoadingLabel('Processing movie...');
+                        setLoadProgress(100);
+                    }
                 }
 
                 setLocalMovieUrl(url);
@@ -471,9 +570,9 @@ export default function VideoPlayer({
                     duration: 0,
                 });
 
-                // Always seed the processed file — viewers need a browser-playable MP4.
-                // mp4box.js can NOT parse non-MP4 containers (MKV, AVI, etc.),
-                // so seeding the raw original for viewer-side remux doesn't work.
+                // Web-compatible rooms seed processed MP4 output.
+                // Native rooms can seed original bytes and let the viewer
+                // remux/transcode on the fly via local middleware.
                 onFileReady?.(processedFile, url, { preTranscode: false, streamPath });
 
                 // Offer to save to library if the file was transcoded/remuxed
@@ -485,7 +584,7 @@ export default function VideoPlayer({
                 setIsLoading(false);
             }
         },
-        [socket, onFileReady, roomCode]
+        [socket, onFileReady, roomCode, roomMode]
     );
 
     const handleSubtitleFile = useCallback(
@@ -678,7 +777,7 @@ export default function VideoPlayer({
         );
     }
 
-    if (!isHost && !movieBlobUrl && !localMovieUrl && !isReceiving) {
+    if (!isHost && !movieBlobUrl && !localMovieUrl && !isReceiving && !isProcessing) {
         return (
             <div className="player__waiting">
                 <div className="player__waiting-content">
@@ -744,12 +843,15 @@ export default function VideoPlayer({
                 style={{ display: 'none' }}
             />
 
-            {(!isHost && isReceiving && !movieBlobUrl && !localMovieUrl) && (
+            {(!isHost && (isReceiving || isProcessing) && !movieBlobUrl && !localMovieUrl) && (
                 <div className="player__download-bar">
                     <span>
-                        Downloading... {downloadProgress}%
-                        {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
-                        {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}
+                        {isProcessing
+                            ? 'Remuxing for playback…'
+                            : <>Downloading... {downloadProgress}%
+                                {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
+                                {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}
+                            </>}
                     </span>
                     <button className="player__browse-btn player__local-btn" onClick={() => viewerFileInputRef.current?.click()}>
                         Load My Copy

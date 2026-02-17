@@ -63,12 +63,13 @@ export function isElectron() {
  * @param {File} file
  * @returns {Promise<{path: 'direct'|'remux'|'transcode', reason: string, probeResult?: object}>}
  */
-export async function classifyFile(file) {
+export async function classifyFile(file, options = {}) {
+    const forceWeb = Boolean(options.forceWeb);
     const ext = getExtension(file.name);
     const mimeType = file.type || '';
 
     /* ─── Electron: everything is direct-playable ─── */
-    if (isElectron()) {
+    if (isElectron() && !forceWeb) {
         return {
             path: 'direct',
             reason: `Electron app — all formats playable via local HTTP streaming (${ext})`,
