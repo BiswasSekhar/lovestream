@@ -847,7 +847,7 @@ export default function VideoPlayer({
                 <div className="player__download-bar">
                     <span>
                         {isProcessing
-                            ? 'Remuxing for playback…'
+                            ? 'Preparing stream…'
                             : <>Downloading... {downloadProgress}%
                                 {transferSpeed > 0 && ` — ${(transferSpeed / (1024 * 1024)).toFixed(1)} MB/s`}
                                 {numPeers > 0 && ` • ${numPeers} peer${numPeers !== 1 ? 's' : ''}`}

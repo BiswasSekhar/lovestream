@@ -5,6 +5,7 @@ import { getTempMedia, saveTempMedia, updateTempMediaPosition, TEMP_MEDIA_TTL_MS
 import { findMovie, loadMovie } from '../utils/movieLibrary.js';
 import { streamTorrentToMSE } from '../utils/mp4Fragmenter.js';
 import { transmuxToFMP4 } from '../utils/mkvHandler.js';
+import { demuxMkvToMSE } from '../utils/mkvStreamDemuxer.js';
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 
@@ -19,7 +20,9 @@ const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
  *
  * Viewer receives magnet + streamPath and picks the right strategy:
  * - 'direct'    → render-media progressive MSE (works for MP4/WebM)
- * - 'remux'     → download → ffmpeg.wasm remux → play (for MKV with H.264)
+ * - 'remux'     → MP4: streamTorrentToMSE (progressive mp4box.js → MSE)
+ *                 MKV: web-demuxer (WASM) → JMuxer → MSE (fast demux, no re-encoding)
+ *                 Fallback: ffmpeg.wasm remux
  * - 'transcode' → download → ffmpeg.wasm transcode → play (for HEVC/AVI)
  *
  * @param {object} params
@@ -436,6 +439,17 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
 
                 startProgressUpdates(torrent);
 
+                /* ─── Piece prioritization for fast startup ─── */
+                // Sequential download: pieces arrive in playback order
+                // Priority 1 = high; ensures pieces download sequentially
+                const totalPieces = torrent.pieces.length;
+                if (totalPieces > 0) {
+                    // Mark first ~2% as critical (ASAP download)
+                    const criticalEnd = Math.min(Math.ceil(totalPieces * 0.02), 20);
+                    torrent.critical(0, criticalEnd);
+                    console.log(`[webtorrent] piece prioritization: ${totalPieces} total, first ${criticalEnd + 1} critical`);
+                }
+
                 // Find the video file in the torrent
                 const videoFile = torrent.files.find(f => {
                     const name = f.name.toLowerCase();
@@ -464,122 +478,208 @@ export default function useWebTorrent({ socket, isHost, videoRef, roomCode, disa
                                 attachElectronJitStream(videoFile, token, streamPath);
                             }
 
-                        } else if (streamPath === 'remux' || streamPath === 'transcode') {
-                            // ═══ BROWSER TORRENT-TO-STREAM: download → ffmpeg.wasm → play ═══
-                            // The torrent contains the original MKV/non-native file.
-                            // We download it fully, then remux/transcode via ffmpeg.wasm.
-                            console.log(`[webtorrent] BROWSER ${streamPath.toUpperCase()} path: download → ffmpeg.wasm → play`);
-                            setIsProcessing(true);
+                        } else if (streamPath === 'remux') {
+                            // ═══ BROWSER REMUX: smart routing based on container ═══
+                            const fname = (videoFile.name || '').toLowerCase();
+                            const isMkvFile = fname.endsWith('.mkv') || fname.endsWith('.webm') || fname.endsWith('.avi');
 
-                            // Wait for full download, then process
-                            torrent.on('done', async () => {
-                                if (token !== currentTorrentTokenRef.current) return;
-                                console.log(`[webtorrent] torrent complete — starting ffmpeg.wasm ${streamPath}...`);
+                            if (!isMkvFile) {
+                                // MP4 file needing fragmentation → progressive MSE (instant playback)
+                                console.log('[webtorrent] REMUX path (MP4): progressive mp4box.js → MSE');
+                                const abortCtrl = new AbortController();
+                                mseAbortRef.current = abortCtrl;
 
-                                try {
-                                    const buf = await videoFile.arrayBuffer();
-                                    const fileName = videoFile.name || 'movie.mkv';
-                                    const lower = fileName.toLowerCase();
-                                    const mime = lower.endsWith('.webm') ? 'video/webm'
-                                        : lower.endsWith('.mkv') ? 'video/x-matroska'
-                                            : lower.endsWith('.mov') ? 'video/quicktime'
-                                                : 'video/mp4';
-                                    const fileBlob = new File([buf], fileName, { type: mime });
-
-                                    const forceH264 = streamPath === 'transcode';
-                                    const result = await transmuxToFMP4(
-                                        fileBlob,
-                                        (p) => {
-                                            if (token !== currentTorrentTokenRef.current) return;
-                                            // Map 0-100 ffmpeg progress to UI
-                                            setDownloadProgress(Math.round(p));
-                                        },
-                                        forceH264 ? { forceH264: true } : undefined
-                                    );
-
+                                streamTorrentToMSE(videoFile, videoRef.current, {
+                                    signal: abortCtrl.signal,
+                                    onProgress: (p) => {
+                                        if (token !== currentTorrentTokenRef.current) return;
+                                        setDownloadProgress(p);
+                                    },
+                                }).then(({ mime }) => {
                                     if (token !== currentTorrentTokenRef.current) return;
+                                    renderMediaReadyRef.current = true;
+                                    console.log('[webtorrent] MSE progressive streaming active, mime:', mime);
+                                    const streamUrl = videoRef.current?.src;
+                                    if (streamUrl) setMovieBlobUrl(streamUrl);
+                                }).catch((err) => {
+                                    if (err.name === 'AbortError' || token !== currentTorrentTokenRef.current) return;
+                                    console.warn('[webtorrent] mp4box.js MSE failed, falling back to render-media:', err.message);
+                                    attachRenderMedia(videoFile, token);
+                                });
+                            } else {
+                                // MKV/non-native file → web-demuxer (WASM) + JMuxer → MSE
+                                // Falls back to ffmpeg.wasm if demuxer fails
+                                console.log('[webtorrent] REMUX path (MKV): web-demuxer + JMuxer → MSE');
+                                setIsProcessing(true);
 
-                                    // Handle case where remux output is still HEVC
-                                    if (!forceH264 && result.isHevc) {
-                                        const hevcOk = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
-                                        if (!hevcOk) {
-                                            console.log('[webtorrent] HEVC detected, re-processing with forceH264...');
+                                torrent.on('done', async () => {
+                                    if (token !== currentTorrentTokenRef.current) return;
+                                    console.log('[webtorrent] MKV download complete — starting web-demuxer pipeline...');
+
+                                    try {
+                                        // Get the file as a Blob for web-demuxer
+                                        const buf = await videoFile.arrayBuffer();
+                                        const fileName = videoFile.name || 'movie.mkv';
+                                        const lower = fileName.toLowerCase();
+                                        const mimeType = lower.endsWith('.webm') ? 'video/webm'
+                                            : lower.endsWith('.mkv') ? 'video/x-matroska'
+                                                : lower.endsWith('.avi') ? 'video/x-msvideo'
+                                                    : 'video/mp4';
+                                        const fileBlob = new File([buf], fileName, { type: mimeType });
+
+                                        // Try web-demuxer + JMuxer (fast, no re-encoding)
+                                        const result = await demuxMkvToMSE(fileBlob, videoRef.current, {
+                                            onProgress: (p) => {
+                                                if (token !== currentTorrentTokenRef.current) return;
+                                                setDownloadProgress(Math.round(p));
+                                            },
+                                        });
+
+                                        if (token !== currentTorrentTokenRef.current) {
+                                            result.cleanup?.();
+                                            return;
+                                        }
+
+                                        console.log(`[webtorrent] MKV demux active: ${result.codec}, ${result.fps} fps`);
+                                        renderMediaReadyRef.current = true;
+                                        setIsProcessing(false);
+                                        setIsReceiving(false);
+                                        setDownloadProgress(100);
+
+                                        // JMuxer manages MSE internally, video should auto-play
+                                        videoRef.current?.play().catch(() => { });
+
+                                        if (!hasSentStreamReadyRef.current) {
+                                            hasSentStreamReadyRef.current = true;
+                                            socket?.current?.emit('viewer-stream-ready', { progress: 100, timestamp: Date.now() });
+                                        }
+                                    } catch (demuxErr) {
+                                        if (token !== currentTorrentTokenRef.current) return;
+                                        console.warn('[webtorrent] web-demuxer failed, falling back to ffmpeg.wasm:', demuxErr.message);
+
+                                        // Fallback: ffmpeg.wasm remux
+                                        try {
+                                            const buf2 = await videoFile.arrayBuffer();
+                                            const fileName2 = videoFile.name || 'movie.mkv';
+                                            const lower2 = fileName2.toLowerCase();
+                                            const mimeType2 = lower2.endsWith('.webm') ? 'video/webm'
+                                                : lower2.endsWith('.mkv') ? 'video/x-matroska'
+                                                    : 'video/mp4';
+                                            const fileBlob2 = new File([buf2], fileName2, { type: mimeType2 });
+
+                                            const forceH264 = demuxErr.message === 'HEVC_NOT_SUPPORTED';
                                             const result2 = await transmuxToFMP4(
-                                                fileBlob,
+                                                fileBlob2,
                                                 (p) => {
                                                     if (token !== currentTorrentTokenRef.current) return;
                                                     setDownloadProgress(Math.round(p));
                                                 },
-                                                { forceH264: true }
+                                                forceH264 ? { forceH264: true } : undefined
                                             );
+
                                             if (token !== currentTorrentTokenRef.current) return;
-                                            URL.revokeObjectURL(result.url);
+
+                                            // If remux produced HEVC and browser can't play it
+                                            if (!forceH264 && result2.isHevc) {
+                                                const hevcOk = MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L93.B0"');
+                                                if (!hevcOk) {
+                                                    console.log('[webtorrent] HEVC detected in fallback, re-processing with forceH264...');
+                                                    const result3 = await transmuxToFMP4(
+                                                        fileBlob2,
+                                                        (p) => {
+                                                            if (token !== currentTorrentTokenRef.current) return;
+                                                            setDownloadProgress(Math.round(p));
+                                                        },
+                                                        { forceH264: true }
+                                                    );
+                                                    if (token !== currentTorrentTokenRef.current) return;
+                                                    URL.revokeObjectURL(result2.url);
+                                                    setMovieBlobUrl(result3.url);
+                                                    renderMediaReadyRef.current = true;
+                                                    setIsProcessing(false);
+                                                    setIsReceiving(false);
+                                                    setDownloadProgress(100);
+                                                    if (!hasSentStreamReadyRef.current) {
+                                                        hasSentStreamReadyRef.current = true;
+                                                        socket?.current?.emit('viewer-stream-ready', { progress: 100, timestamp: Date.now() });
+                                                    }
+                                                    if (videoRef?.current) {
+                                                        videoRef.current.src = result3.url;
+                                                        videoRef.current.play().catch(() => { });
+                                                    }
+                                                    return;
+                                                }
+                                            }
+
                                             setMovieBlobUrl(result2.url);
                                             renderMediaReadyRef.current = true;
                                             setIsProcessing(false);
                                             setIsReceiving(false);
                                             setDownloadProgress(100);
-
                                             if (!hasSentStreamReadyRef.current) {
                                                 hasSentStreamReadyRef.current = true;
-                                                socket?.current?.emit('viewer-stream-ready', {
-                                                    progress: 100,
-                                                    timestamp: Date.now(),
-                                                });
+                                                socket?.current?.emit('viewer-stream-ready', { progress: 100, timestamp: Date.now() });
                                             }
-
                                             if (videoRef?.current) {
                                                 videoRef.current.src = result2.url;
                                                 videoRef.current.play().catch(() => { });
                                             }
-                                            return;
+                                        } catch (ffmpegErr) {
+                                            console.warn('[webtorrent] ffmpeg.wasm fallback also failed:', ffmpegErr.message);
+                                            setIsProcessing(false);
+                                            attachRenderMedia(videoFile, token);
                                         }
                                     }
+                                });
+                            }
+
+                        } else if (streamPath === 'transcode') {
+                            // ═══ BROWSER TRANSCODE: download → ffmpeg.wasm → play ═══
+                            console.log('[webtorrent] TRANSCODE path: download → ffmpeg.wasm transcode → play');
+                            setIsProcessing(true);
+
+                            torrent.on('done', async () => {
+                                if (token !== currentTorrentTokenRef.current) return;
+                                console.log('[webtorrent] download complete — starting ffmpeg.wasm transcode...');
+
+                                try {
+                                    const buf = await videoFile.arrayBuffer();
+                                    const fileName = videoFile.name || 'movie.mkv';
+                                    const lower = fileName.toLowerCase();
+                                    const mimeType = lower.endsWith('.webm') ? 'video/webm'
+                                        : lower.endsWith('.mkv') ? 'video/x-matroska'
+                                            : lower.endsWith('.mov') ? 'video/quicktime'
+                                                : 'video/mp4';
+                                    const fileBlob = new File([buf], fileName, { type: mimeType });
+
+                                    const result = await transmuxToFMP4(
+                                        fileBlob,
+                                        (p) => {
+                                            if (token !== currentTorrentTokenRef.current) return;
+                                            setDownloadProgress(Math.round(p));
+                                        },
+                                        { forceH264: true }
+                                    );
+
+                                    if (token !== currentTorrentTokenRef.current) return;
 
                                     setMovieBlobUrl(result.url);
                                     renderMediaReadyRef.current = true;
                                     setIsProcessing(false);
                                     setIsReceiving(false);
                                     setDownloadProgress(100);
-
                                     if (!hasSentStreamReadyRef.current) {
                                         hasSentStreamReadyRef.current = true;
-                                        socket?.current?.emit('viewer-stream-ready', {
-                                            progress: 100,
-                                            timestamp: Date.now(),
-                                        });
+                                        socket?.current?.emit('viewer-stream-ready', { progress: 100, timestamp: Date.now() });
                                     }
-
                                     if (videoRef?.current) {
                                         videoRef.current.src = result.url;
                                         videoRef.current.play().catch(() => { });
                                     }
                                 } catch (err) {
-                                    console.warn(`[webtorrent] ffmpeg.wasm ${streamPath} failed:`, err.message);
+                                    console.warn('[webtorrent] ffmpeg.wasm transcode failed:', err.message);
                                     setIsProcessing(false);
-
-                                    // Fallback 1: try mp4box.js MSE (works if file is actually MP4)
-                                    if (streamPath === 'remux') {
-                                        console.log('[webtorrent] falling back to mp4box.js MSE...');
-                                        const abortCtrl = new AbortController();
-                                        mseAbortRef.current = abortCtrl;
-                                        try {
-                                            await streamTorrentToMSE(videoFile, videoRef.current, {
-                                                signal: abortCtrl.signal,
-                                                onProgress: (p) => {
-                                                    if (token !== currentTorrentTokenRef.current) return;
-                                                    setDownloadProgress(p);
-                                                },
-                                            });
-                                            renderMediaReadyRef.current = true;
-                                        } catch (mseErr) {
-                                            console.warn('[webtorrent] mp4box.js MSE also failed, trying render-media:', mseErr.message);
-                                            attachRenderMedia(videoFile, token);
-                                        }
-                                    } else {
-                                        // Fallback 2: render-media (last resort)
-                                        attachRenderMedia(videoFile, token);
-                                    }
+                                    attachRenderMedia(videoFile, token);
                                 }
                             });
 

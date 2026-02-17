@@ -56,6 +56,7 @@
         "@ffmpeg/ffmpeg": "^0.12.15",
         "@ffmpeg/util": "^0.12.2",
         "buffer": "^6.0.3",
+        "jmuxer": "^2.1.0",
         "mp4box": "^2.3.0",
         "process": "^0.11.10",
         "react": "^19.0.0",
@@ -64,6 +65,7 @@
         "render-media": "^4.1.0",
         "simple-peer": "^9.11.1",
         "socket.io-client": "^4.8.1",
+        "web-demuxer": "^4.0.0",
         "webtorrent": "^2.8.5"
     },
     "devDependencies": {
