@@ -6,8 +6,7 @@ class RoomManager {
         this.socketToRoom = new Map();
     }
 
-    createRoom(socketId, participantId, capabilities = {}, requestedCode = null) {
-        // Use requested code if provided and not already taken (e.g. host re-creating after server restart)
+    createRoom(socketId, participantId, capabilities = {}, requestedCode = null, name = 'Host') {
         let code;
         if (requestedCode) {
             const normalized = requestedCode.trim().toUpperCase();
@@ -15,17 +14,21 @@ class RoomManager {
         } else {
             code = this.#generateUniqueCode();
         }
+
+        const participant = {
+            socketId,
+            participantId: participantId || null,
+            role: 'host',
+            name,
+            capabilities: this.#normalizeCapabilities(capabilities),
+            disconnectedAt: null,
+            joinedAt: Date.now(),
+        };
+
         const room = {
             code,
-            host: socketId,
-            viewer: null,
-            hostParticipantId: participantId || null,
-            viewerParticipantId: null,
-            hostDisconnectedAt: null,
-            viewerDisconnectedAt: null,
-            hostCapabilities: this.#normalizeCapabilities(capabilities),
-            viewerCapabilities: { nativePlayback: false },
-            mode: 'web-compatible',
+            participants: [participant],
+            maxParticipants: 6,
             createdAt: Date.now(),
             cache: {
                 movie: null,
@@ -41,77 +44,67 @@ class RoomManager {
         return room;
     }
 
-    joinRoom(code, socketId, participantId, capabilities = {}, { graceMs = 120000 } = {}) {
+    joinRoom(code, socketId, participantId, capabilities = {}, { graceMs = 120000, name = 'Guest' } = {}) {
         const room = this.rooms.get(code);
         if (!room) {
             return { error: 'Room not found. Check the code and try again.' };
         }
 
-        this.#pruneRoomReservations(room, graceMs);
+        this.#pruneDisconnected(room, graceMs);
 
-        if (room.host === socketId) return { room, role: 'host' };
-        if (room.viewer === socketId) return { room, role: 'viewer' };
+        // Already in room?
+        const existing = room.participants.find(p => p.socketId === socketId);
+        if (existing) return { room, role: existing.role };
 
-        const participant = participantId || null;
-        const caps = this.#normalizeCapabilities(capabilities);
-
-        if (!room.host && room.hostParticipantId && participant && room.hostParticipantId === participant) {
-            room.host = socketId;
-            room.hostDisconnectedAt = null;
-            room.hostCapabilities = caps;
-            this.#recomputeRoomMode(room);
-            this.socketToRoom.set(socketId, code);
-            return { room, role: 'host', reclaimed: true };
-        }
-
-        if (!room.viewer && room.viewerParticipantId && participant && room.viewerParticipantId === participant) {
-            room.viewer = socketId;
-            room.viewerDisconnectedAt = null;
-            room.viewerCapabilities = caps;
-            this.#recomputeRoomMode(room);
-            this.socketToRoom.set(socketId, code);
-            return { room, role: 'viewer', reclaimed: true };
-        }
-
-        if (!room.viewer) {
-            if (room.viewerParticipantId && room.viewerParticipantId !== participant) {
-                return { error: 'Partner is reconnecting. Please try again in a moment.' };
-            }
-
-            room.viewer = socketId;
-            room.viewerParticipantId = participant;
-            room.viewerDisconnectedAt = null;
-            room.viewerCapabilities = caps;
-            this.#recomputeRoomMode(room);
-            this.socketToRoom.set(socketId, code);
-            return { room, role: 'viewer' };
-        }
-        // Room appears full — but the reconnecting peer may have the same participantId
-        // as a stale socket whose disconnect event hasn't fired yet. Force-evict the stale one.
-        if (participant) {
-            if (room.hostParticipantId === participant && room.host !== socketId) {
-                console.log(`[room] force-evicting stale host socket ${room.host} for participant ${participant}`);
-                this.socketToRoom.delete(room.host);
-                room.host = socketId;
-                room.hostDisconnectedAt = null;
-                room.hostCapabilities = caps;
-                this.#recomputeRoomMode(room);
+        // Reconnecting participant?
+        if (participantId) {
+            const stale = room.participants.find(
+                p => p.participantId === participantId && !p.socketId
+            );
+            if (stale) {
+                stale.socketId = socketId;
+                stale.disconnectedAt = null;
+                stale.capabilities = this.#normalizeCapabilities(capabilities);
+                if (name) stale.name = name;
                 this.socketToRoom.set(socketId, code);
-                return { room, role: 'host', reclaimed: true };
+                return { room, role: stale.role, reclaimed: true };
             }
-            if (room.viewerParticipantId === participant && room.viewer !== socketId) {
-                console.log(`[room] force-evicting stale viewer socket ${room.viewer} for participant ${participant}`);
-                this.socketToRoom.delete(room.viewer);
-                room.viewer = socketId;
-                room.viewerDisconnectedAt = null;
-                room.viewerCapabilities = caps;
-                this.#recomputeRoomMode(room);
+
+            // Force-evict stale socket with same participantId
+            const staleConnected = room.participants.find(
+                p => p.participantId === participantId && p.socketId !== socketId
+            );
+            if (staleConnected) {
+                console.log(`[room] force-evicting stale socket ${staleConnected.socketId} for participant ${participantId}`);
+                this.socketToRoom.delete(staleConnected.socketId);
+                staleConnected.socketId = socketId;
+                staleConnected.disconnectedAt = null;
+                staleConnected.capabilities = this.#normalizeCapabilities(capabilities);
+                if (name) staleConnected.name = name;
                 this.socketToRoom.set(socketId, code);
-                return { room, role: 'viewer', reclaimed: true };
+                return { room, role: staleConnected.role, reclaimed: true };
             }
         }
 
-        return { error: 'Room is full. Only 1-on-1 sessions are supported.' };
+        // Check capacity
+        const activeCount = room.participants.filter(p => p.socketId || p.disconnectedAt).length;
+        if (activeCount >= room.maxParticipants) {
+            return { error: `Room is full (max ${room.maxParticipants} participants).` };
+        }
+
+        // New participant joins as viewer
+        const participant = {
+            socketId,
+            participantId: participantId || null,
+            role: 'viewer',
+            name,
+            capabilities: this.#normalizeCapabilities(capabilities),
+            disconnectedAt: null,
+            joinedAt: Date.now(),
+        };
+        room.participants.push(participant);
+        this.socketToRoom.set(socketId, code);
+        return { room, role: 'viewer' };
     }
 
     leaveRoom(socketId) {
@@ -122,39 +115,41 @@ class RoomManager {
         this.socketToRoom.delete(socketId);
         if (!room) return null;
 
-        let role = null;
-        let peerSocketId = null;
+        const participant = room.participants.find(p => p.socketId === socketId);
+        if (!participant) return null;
 
-        if (room.host === socketId) {
-            role = 'host';
-            peerSocketId = room.viewer;
-            room.host = null;
-            room.hostDisconnectedAt = Date.now();
-        } else if (room.viewer === socketId) {
-            role = 'viewer';
-            peerSocketId = room.host;
-            room.viewer = null;
-            room.viewerDisconnectedAt = Date.now();
+        const role = participant.role;
+        const otherSocketIds = room.participants
+            .filter(p => p.socketId && p.socketId !== socketId)
+            .map(p => p.socketId);
+
+        // Mark as disconnected (keep reservation for reconnect)
+        participant.socketId = null;
+        participant.disconnectedAt = Date.now();
+
+        // If host left, promote the next connected participant
+        if (role === 'host') {
+            const nextHost = room.participants.find(p => p.socketId && p.role !== 'host');
+            if (nextHost) {
+                nextHost.role = 'host';
+            }
         }
 
-        this.#recomputeRoomMode(room);
-
-        return { code, role, peerSocketId };
+        return { code, role, otherSocketIds };
     }
 
     cleanupExpired(graceMs = 120000) {
-        const now = Date.now();
-
         for (const [code, room] of this.rooms.entries()) {
-            this.#pruneRoomReservations(room, graceMs, now);
+            this.#pruneDisconnected(room, graceMs);
 
-            const noConnectedPeers = !room.host && !room.viewer;
-            const noReservations = !room.hostParticipantId && !room.viewerParticipantId;
-            if (noConnectedPeers && noReservations) {
+            const hasAnyone = room.participants.some(p => p.socketId || p.disconnectedAt);
+            if (!hasAnyone) {
                 this.rooms.delete(code);
             }
         }
     }
+
+    // ─── Query helpers ─────────────────────────────────────────
 
     getRoom(code) {
         return this.rooms.get(code) || null;
@@ -168,28 +163,54 @@ class RoomManager {
     getRoleInRoom(socketId) {
         const room = this.getRoomBySocket(socketId);
         if (!room) return null;
-        if (room.host === socketId) return 'host';
-        if (room.viewer === socketId) return 'viewer';
-        return null;
+        const p = room.participants.find(p => p.socketId === socketId);
+        return p ? p.role : null;
     }
 
-    getPeerSocketId(socketId) {
+    getParticipantName(socketId) {
         const room = this.getRoomBySocket(socketId);
         if (!room) return null;
-        if (room.host === socketId) return room.viewer;
-        if (room.viewer === socketId) return room.host;
-        return null;
+        const p = room.participants.find(p => p.socketId === socketId);
+        return p ? p.name : null;
+    }
+
+    /**
+     * Returns all other connected participants' socket IDs (for mesh WebRTC).
+     */
+    getOtherParticipants(socketId) {
+        const room = this.getRoomBySocket(socketId);
+        if (!room) return [];
+        return room.participants
+            .filter(p => p.socketId && p.socketId !== socketId)
+            .map(p => p.socketId);
+    }
+
+    /**
+     * Returns the full participant list for UI display.
+     */
+    getParticipantList(code) {
+        const room = this.rooms.get(code);
+        if (!room) return [];
+        return room.participants
+            .filter(p => p.socketId) // only connected
+            .map(p => ({
+                id: p.socketId,
+                participantId: p.participantId,
+                name: p.name,
+                role: p.role,
+            }));
+    }
+
+    // ─── Legacy compat — getPeerSocketId for 1:1 fallback ────
+    getPeerSocketId(socketId) {
+        const others = this.getOtherParticipants(socketId);
+        return others.length > 0 ? others[0] : null;
     }
 
     updateRoomCache(code, patch) {
         const room = this.rooms.get(code);
         if (!room) return;
-
-        room.cache = {
-            ...room.cache,
-            ...patch,
-            updatedAt: Date.now(),
-        };
+        room.cache = { ...room.cache, ...patch, updatedAt: Date.now() };
     }
 
     getRoomSnapshot(code) {
@@ -200,28 +221,24 @@ class RoomManager {
 
     getRoomMode(code) {
         const room = this.rooms.get(code);
-        return room?.mode || 'web-compatible';
+        if (!room) return 'web-compatible';
+        return this.#computeRoomMode(room);
     }
 
     getRoomModeBySocket(socketId) {
         const room = this.getRoomBySocket(socketId);
-        return room?.mode || 'web-compatible';
+        if (!room) return 'web-compatible';
+        return this.#computeRoomMode(room);
     }
 
-    #pruneRoomReservations(room, graceMs, now = Date.now()) {
-        if (!room.host && room.hostParticipantId && room.hostDisconnectedAt && now - room.hostDisconnectedAt > graceMs) {
-            room.hostParticipantId = null;
-            room.hostDisconnectedAt = null;
-            room.hostCapabilities = { nativePlayback: false };
-        }
+    // ─── Private ──────────────────────────────────────────────
 
-        if (!room.viewer && room.viewerParticipantId && room.viewerDisconnectedAt && now - room.viewerDisconnectedAt > graceMs) {
-            room.viewerParticipantId = null;
-            room.viewerDisconnectedAt = null;
-            room.viewerCapabilities = { nativePlayback: false };
-        }
-
-        this.#recomputeRoomMode(room);
+    #pruneDisconnected(room, graceMs, now = Date.now()) {
+        room.participants = room.participants.filter(p => {
+            if (p.socketId) return true; // connected
+            if (p.disconnectedAt && now - p.disconnectedAt > graceMs) return false; // expired
+            return true; // still within grace period
+        });
     }
 
     #generateUniqueCode() {
@@ -238,10 +255,11 @@ class RoomManager {
         };
     }
 
-    #recomputeRoomMode(room) {
-        const bothConnected = Boolean(room.host && room.viewer && !room.hostDisconnectedAt && !room.viewerDisconnectedAt);
-        const bothNative = Boolean(room.hostCapabilities?.nativePlayback) && Boolean(room.viewerCapabilities?.nativePlayback);
-        room.mode = bothConnected && bothNative ? 'native' : 'web-compatible';
+    #computeRoomMode(room) {
+        const connected = room.participants.filter(p => p.socketId);
+        if (connected.length < 2) return 'web-compatible';
+        const allNative = connected.every(p => p.capabilities?.nativePlayback);
+        return allNative ? 'native' : 'web-compatible';
     }
 }
 

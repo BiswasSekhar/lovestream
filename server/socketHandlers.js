@@ -1,11 +1,16 @@
 export default function registerSocketHandlers(io, roomManager) {
-    // Track which sockets are ready for WebRTC
     const readySockets = new Set();
     const RECONNECT_GRACE_MS = 24 * 60 * 60 * 1000;
 
     setInterval(() => {
         roomManager.cleanupExpired(RECONNECT_GRACE_MS);
     }, 30000);
+
+    // Helper: broadcast updated participant list to the entire room
+    function broadcastParticipants(code) {
+        const list = roomManager.getParticipantList(code);
+        io.in(code).emit('participant-list', { participants: list });
+    }
 
     io.on('connection', (socket) => {
         console.log(`[connect] ${socket.id}`);
@@ -16,23 +21,28 @@ export default function registerSocketHandlers(io, roomManager) {
             const payload = typeof payloadOrCb === 'function' ? {} : (payloadOrCb || {});
             const participantId = payload.participantId || null;
             const capabilities = payload.capabilities || {};
+            const name = payload.name || 'Host';
 
-            const room = roomManager.createRoom(socket.id, participantId, capabilities, payload.requestedCode);
+            const room = roomManager.createRoom(socket.id, participantId, capabilities, payload.requestedCode, name);
             socket.join(room.code);
-            console.log(`[room] ${socket.id} created room ${room.code}`);
+            console.log(`[room] ${socket.id} (${name}) created room ${room.code}`);
+
             callback?.({
                 success: true,
                 room: { code: room.code, role: 'host' },
-                mode: room.mode,
+                mode: roomManager.getRoomMode(room.code),
                 reconnectGraceMs: RECONNECT_GRACE_MS,
             });
+
+            broadcastParticipants(room.code);
         });
 
-        socket.on('join-room', ({ code, participantId, capabilities } = {}, callback) => {
+        socket.on('join-room', ({ code, participantId, capabilities, name } = {}, callback) => {
             const normalizedCode = (code || '').trim().toUpperCase();
             roomManager.cleanupExpired(RECONNECT_GRACE_MS);
             const result = roomManager.joinRoom(normalizedCode, socket.id, participantId || null, capabilities || {}, {
                 graceMs: RECONNECT_GRACE_MS,
+                name: name || 'Guest',
             });
 
             if (result.error) {
@@ -41,7 +51,7 @@ export default function registerSocketHandlers(io, roomManager) {
             }
 
             socket.join(normalizedCode);
-            console.log(`[room] ${socket.id} joined room ${normalizedCode}`);
+            console.log(`[room] ${socket.id} (${name || 'Guest'}) joined room ${normalizedCode} as ${result.role}`);
 
             callback?.({
                 success: true,
@@ -52,7 +62,17 @@ export default function registerSocketHandlers(io, roomManager) {
 
             io.in(normalizedCode).emit('room-mode', { mode: roomManager.getRoomMode(normalizedCode) });
 
-            // Replay cached room state to reconnecting/joining peer.
+            // Notify existing participants about the new joiner
+            socket.to(normalizedCode).emit('participant-joined', {
+                id: socket.id,
+                name: name || 'Guest',
+                role: result.role || 'viewer',
+            });
+
+            // Send full participant list
+            broadcastParticipants(normalizedCode);
+
+            // Replay cached room state to the joining peer
             const snapshot = roomManager.getRoomSnapshot(normalizedCode);
             if (snapshot?.movie) {
                 io.to(socket.id).emit('movie-loaded', snapshot.movie);
@@ -75,53 +95,63 @@ export default function registerSocketHandlers(io, roomManager) {
             if (!room) return;
 
             const role = roomManager.getRoleInRoom(socket.id);
-            const peerId = roomManager.getPeerSocketId(socket.id);
-            console.log(`[ready] ${socket.id} (${role}) is ready, peer: ${peerId}, peerReady: ${peerId ? readySockets.has(peerId) : 'N/A'}`);
+            const others = roomManager.getOtherParticipants(socket.id);
+            console.log(`[ready] ${socket.id} (${role}) is ready, ${others.length} other peers`);
 
-            // Check if both peers are ready
-            if (peerId && readySockets.has(peerId)) {
-                console.log(`[ready] BOTH peers are ready! Telling host to initiate WebRTC`);
-                // Tell the HOST to start as initiator
-                const hostId = room.host;
-                const viewerId = room.viewer;
-                if (hostId && viewerId) {
-                    io.to(hostId).emit('start-webrtc', { peerId: viewerId, role: 'host' });
-                    io.to(viewerId).emit('start-webrtc', { peerId: hostId, role: 'viewer' });
+            // Tell this peer to initiate WebRTC with all already-ready peers
+            others.forEach(peerId => {
+                if (readySockets.has(peerId)) {
+                    console.log(`[ready] telling ${socket.id} to connect with ${peerId}`);
+                    // The new peer initiates connections to existing peers
+                    io.to(socket.id).emit('start-webrtc', { peerId, initiator: true });
+                    io.to(peerId).emit('start-webrtc', { peerId: socket.id, initiator: false });
+                }
+            });
+        });
+
+        // ─── WebRTC Signaling (targeted for mesh) ─────────────────
+        socket.on('offer', ({ offer, to }) => {
+            if (to) {
+                console.log(`[signal] relaying offer from ${socket.id} to ${to}`);
+                io.to(to).emit('offer', { offer, from: socket.id });
+            } else {
+                // Legacy fallback: send to first peer
+                const peerId = roomManager.getPeerSocketId(socket.id);
+                if (peerId) {
+                    console.log(`[signal] relaying offer from ${socket.id} to ${peerId} (legacy)`);
+                    io.to(peerId).emit('offer', { offer, from: socket.id });
                 }
             }
         });
 
-        // ─── WebRTC Signaling ────────────────────────────────────
-        socket.on('offer', ({ offer }) => {
-            const peerId = roomManager.getPeerSocketId(socket.id);
-            if (peerId) {
-                console.log(`[signal] relaying offer from ${socket.id} to ${peerId}`);
-                io.to(peerId).emit('offer', { offer, from: socket.id });
+        socket.on('answer', ({ answer, to }) => {
+            if (to) {
+                console.log(`[signal] relaying answer from ${socket.id} to ${to}`);
+                io.to(to).emit('answer', { answer, from: socket.id });
+            } else {
+                const peerId = roomManager.getPeerSocketId(socket.id);
+                if (peerId) {
+                    console.log(`[signal] relaying answer from ${socket.id} to ${peerId} (legacy)`);
+                    io.to(peerId).emit('answer', { answer, from: socket.id });
+                }
             }
         });
 
-        socket.on('answer', ({ answer }) => {
-            const peerId = roomManager.getPeerSocketId(socket.id);
-            if (peerId) {
-                console.log(`[signal] relaying answer from ${socket.id} to ${peerId}`);
-                io.to(peerId).emit('answer', { answer, from: socket.id });
-            }
-        });
-
-        socket.on('ice-candidate', ({ candidate }) => {
-            const peerId = roomManager.getPeerSocketId(socket.id);
-            if (peerId) {
-                io.to(peerId).emit('ice-candidate', { candidate, from: socket.id });
+        socket.on('ice-candidate', ({ candidate, to }) => {
+            if (to) {
+                io.to(to).emit('ice-candidate', { candidate, from: socket.id });
+            } else {
+                const peerId = roomManager.getPeerSocketId(socket.id);
+                if (peerId) {
+                    io.to(peerId).emit('ice-candidate', { candidate, from: socket.id });
+                }
             }
         });
 
         // ─── Playback Sync ──────────────────────────────────────
         socket.on('sync-play', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (!room) {
-                console.warn(`[sync] sync-play from ${socket.id} but no room found (server may have restarted)`);
-                return;
-            }
+            if (!room) return;
             roomManager.updateRoomCache(room.code, {
                 playback: { type: 'play', time, actionId, updatedAt: Date.now() },
             });
@@ -130,10 +160,7 @@ export default function registerSocketHandlers(io, roomManager) {
 
         socket.on('sync-pause', ({ time, actionId }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (!room) {
-                console.warn(`[sync] sync-pause from ${socket.id} but no room found (server may have restarted)`);
-                return;
-            }
+            if (!room) return;
             roomManager.updateRoomCache(room.code, {
                 playback: { type: 'pause', time, actionId, updatedAt: Date.now() },
             });
@@ -153,16 +180,16 @@ export default function registerSocketHandlers(io, roomManager) {
         // ─── Chat ────────────────────────────────────────────────
         socket.on('chat-message', ({ text }) => {
             const room = roomManager.getRoomBySocket(socket.id);
-            if (!room) {
-                console.warn(`[chat] chat-message from ${socket.id} but no room found (server may have restarted)`);
-                return;
-            }
+            if (!room) return;
             if (text && text.trim()) {
+                const name = roomManager.getParticipantName(socket.id) || 'Unknown';
                 const role = roomManager.getRoleInRoom(socket.id);
                 const message = {
                     id: `${socket.id}-${Date.now()}`,
                     text: text.trim(),
-                    sender: role,
+                    sender: name,
+                    senderRole: role,
+                    senderId: socket.id,
                     timestamp: Date.now(),
                 };
                 io.in(room.code).emit('chat-message', message);
@@ -176,11 +203,8 @@ export default function registerSocketHandlers(io, roomManager) {
                 roomManager.updateRoomCache(room.code, {
                     subtitles: { subtitles, filename },
                 });
-            }
-
-            const peerId = roomManager.getPeerSocketId(socket.id);
-            if (peerId) {
-                io.to(peerId).emit('subtitle-data', { subtitles, filename });
+                // Broadcast to all others in room
+                socket.to(room.code).emit('subtitle-data', { subtitles, filename });
             }
         });
 
@@ -242,7 +266,6 @@ export default function registerSocketHandlers(io, roomManager) {
         socket.on('torrent-magnet', ({ magnetURI, preTranscode, name, streamPath }) => {
             const room = roomManager.getRoomBySocket(socket.id);
             if (room) {
-                // Cache only finalized playable magnet for reconnect replay.
                 if (!preTranscode) {
                     roomManager.updateRoomCache(room.code, {
                         magnet: {
@@ -269,13 +292,14 @@ export default function registerSocketHandlers(io, roomManager) {
             readySockets.delete(socket.id);
             const result = roomManager.leaveRoom(socket.id);
             if (result) {
-                const { code, role, peerSocketId } = result;
-                if (peerSocketId) {
-                    io.to(peerSocketId).emit('peer-left', {
-                        role,
-                        temporary: false,
-                    });
-                }
+                const { code, role, otherSocketIds } = result;
+                // Notify remaining participants
+                io.in(code).emit('participant-left', {
+                    id: socket.id,
+                    role,
+                    temporary: false,
+                });
+                broadcastParticipants(code);
                 io.in(code).emit('room-mode', { mode: roomManager.getRoomMode(code) });
             }
         });
@@ -286,14 +310,14 @@ export default function registerSocketHandlers(io, roomManager) {
             readySockets.delete(socket.id);
             const result = roomManager.leaveRoom(socket.id);
             if (result) {
-                const { code, role, peerSocketId } = result;
-                if (peerSocketId) {
-                    io.to(peerSocketId).emit('peer-left', {
-                        role,
-                        temporary: true,
-                        reconnectGraceMs: RECONNECT_GRACE_MS,
-                    });
-                }
+                const { code, role, otherSocketIds } = result;
+                io.in(code).emit('participant-left', {
+                    id: socket.id,
+                    role,
+                    temporary: true,
+                    reconnectGraceMs: RECONNECT_GRACE_MS,
+                });
+                broadcastParticipants(code);
                 io.in(code).emit('room-mode', { mode: roomManager.getRoomMode(code) });
             }
         });
